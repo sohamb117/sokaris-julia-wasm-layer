@@ -27,6 +27,7 @@ sjulia has four execution paths:
 | **Register VM** | Future default (#8448, SSA IR #8440) | Prototype measurements (#8559) |
 | **AoT** (Core IR → Rust codegen, Cranelift; `subset_julia_vm_runtime`) | Static native-code output path | `--features aot` only: **nightly** `test_aot.sh` (#8633); no PR gate |
 | **WASM** | Web runtime (`subset_julia_vm_web`) | Build-only; execution smoke tracked as #8688 |
+| **Wasm AoT** | Experimental standalone `IrModule` output (`aot-wasm`) | Node execution tests; no runtime imports or backend fallback |
 
 The problem this ADR resolves: AoT's standing was **contradictory**. Design
 principle 7 ("prioritize VM over AoT unless asked") declared it non-priority,
@@ -133,6 +134,31 @@ Concretely:
 - `#[cfg(feature = "aot")]` gating stays: the default build/test matrix is
   unchanged; protection comes from the new CI jobs, not from unconditional
   compilation.
+
+### Experimental standalone Wasm AoT slice (2026-08-18)
+
+`AotBackend::Wasm` is a separate artifact backend, not the
+`subset_julia_vm_web` interpreter transport. With `aot-wasm`, the canonical
+Core IR → inference → optimized `AotProgram` pipeline lowers into the same
+backend-neutral `IrModule` model consumed by native codegen and encodes a core
+WebAssembly module with `wasm-encoder =0.244.0`.
+
+The first supported surface is deliberately static: Int64, Float64, Bool,
+UInt8, arbitrary-rank statically typed UInt8 descriptors, constants, locals,
+arithmetic/comparisons, unary operations, branches, loops, phi edges, returns,
+and direct calls. Every unsupported type, expression, instruction, or terminator
+returns `UnsupportedInstructionDiagnostic`; there is no Rust, VM, or JavaScript
+fallback. Generated modules import nothing.
+
+Linear-memory descriptor ABI v2 uses a 40-byte aligned header followed by inline
+`{dim:u64,stride:i64}` pairs. UInt8 keeps stable element tag 1, rank is capped at
+8, and `layout_id=0` remains reserved. Static tag/rank, mirrored size/count,
+checked shape/address extents, and metadata/data disjointness are validated before
+data access. Each dimension is bounded inclusively at `2^31`. Julia indices remain
+one-based; stride zero intentionally represents an aliasing view even when
+`MODULE_OWNED` controls its lifetime. Ownership does not yet imply canonical
+strides. Negative strides and canonical-stride rules are deferred to the general
+array slice. The module exports `memory` and `__sjulia_wasm_abi_version`.
 - REGISTER_VM.md's side-by-side policy for the stack VM is untouched. When
   the register VM reaches parity, the stack VM's retirement terms get decided
   there, informed by this ADR's lesson: **no backend lingers in unverified

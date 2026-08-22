@@ -339,7 +339,13 @@ impl DeadCodeElimination {
                     Instruction::UnaryOp { operand, .. } => {
                         uses.insert(format!("{}.{}", operand.name, operand.version));
                     }
-                    Instruction::Call { args, .. } | Instruction::CallMulti { args, .. } => {
+                    Instruction::UnitRangeLength { start, stop, .. } => {
+                        uses.insert(format!("{}.{}", start.name, start.version));
+                        uses.insert(format!("{}.{}", stop.name, stop.version));
+                    }
+                    Instruction::Builtin { args, .. }
+                    | Instruction::Call { args, .. }
+                    | Instruction::CallMulti { args, .. } => {
                         for arg in args {
                             uses.insert(format!("{}.{}", arg.name, arg.version));
                         }
@@ -349,18 +355,68 @@ impl DeadCodeElimination {
                             uses.insert(format!("{}.{}", field.value.name, field.value.version));
                         }
                     }
-                    Instruction::GetIndex { array, index, .. } => {
+                    Instruction::ArrayNew { dims, .. } => {
+                        for dim in dims {
+                            uses.insert(format!("{}.{}", dim.name, dim.version));
+                        }
+                    }
+                    Instruction::ArraySlice {
+                        source,
+                        selectors,
+                        dims,
+                        ..
+                    } => {
+                        uses.insert(format!("{}.{}", source.name, source.version));
+                        for dim in dims {
+                            uses.insert(format!("{}.{}", dim.name, dim.version));
+                        }
+                        for selector in selectors {
+                            match selector {
+                                crate::aot::ir::ArraySelector::Scalar(value) => {
+                                    uses.insert(format!("{}.{}", value.name, value.version));
+                                }
+                                crate::aot::ir::ArraySelector::UnitRange { start, stop } => {
+                                    uses.insert(format!("{}.{}", start.name, start.version));
+                                    uses.insert(format!("{}.{}", stop.name, stop.version));
+                                }
+                            }
+                        }
+                    }
+                    Instruction::GetIndex { array, indices, .. } => {
                         uses.insert(format!("{}.{}", array.name, array.version));
-                        uses.insert(format!("{}.{}", index.name, index.version));
+                        for index in indices {
+                            uses.insert(format!("{}.{}", index.name, index.version));
+                        }
                     }
                     Instruction::SetIndex {
                         array,
-                        index,
+                        indices,
                         value,
                     } => {
                         uses.insert(format!("{}.{}", array.name, array.version));
-                        uses.insert(format!("{}.{}", index.name, index.version));
+                        for index in indices {
+                            uses.insert(format!("{}.{}", index.name, index.version));
+                        }
                         uses.insert(format!("{}.{}", value.name, value.version));
+                    }
+                    Instruction::ArraySliceAssign {
+                        array,
+                        selectors,
+                        value,
+                    } => {
+                        uses.insert(format!("{}.{}", array.name, array.version));
+                        uses.insert(format!("{}.{}", value.name, value.version));
+                        for selector in selectors {
+                            match selector {
+                                crate::aot::ir::ArraySelector::Scalar(index) => {
+                                    uses.insert(format!("{}.{}", index.name, index.version));
+                                }
+                                crate::aot::ir::ArraySelector::UnitRange { start, stop } => {
+                                    uses.insert(format!("{}.{}", start.name, start.version));
+                                    uses.insert(format!("{}.{}", stop.name, stop.version));
+                                }
+                            }
+                        }
                     }
                     Instruction::GetField { object, .. } => {
                         uses.insert(format!("{}.{}", object.name, object.version));
@@ -384,7 +440,9 @@ impl DeadCodeElimination {
                             uses.insert(format!("{}.{}", var.name, var.version));
                         }
                     }
-                    Instruction::LoadConst { .. } => {}
+                    Instruction::LoadConst { .. }
+                    | Instruction::Rand { .. }
+                    | Instruction::Randn { .. } => {}
                 }
             }
 
@@ -424,9 +482,14 @@ impl DeadCodeElimination {
                 Instruction::Copy { dest, .. } => Some(dest),
                 Instruction::BinOp { dest, .. } => Some(dest),
                 Instruction::UnaryOp { dest, .. } => Some(dest),
+                Instruction::UnitRangeLength { dest, .. } => Some(dest),
+                Instruction::Builtin { .. }
+                | Instruction::Rand { .. }
+                | Instruction::Randn { .. } => return true,
                 Instruction::GetIndex { dest, .. } => Some(dest),
                 Instruction::GetField { dest, .. } => Some(dest),
                 Instruction::StructNew { dest, .. } => Some(dest),
+                Instruction::ArrayNew { .. } | Instruction::ArraySlice { .. } => return true,
                 Instruction::GetFieldOffset { dest, .. } => Some(dest),
                 Instruction::TypeAssert { dest, .. } => Some(dest),
                 Instruction::Phi { dest, .. } => Some(dest),
@@ -436,6 +499,7 @@ impl DeadCodeElimination {
                     return true;
                 }
                 Instruction::SetIndex { .. }
+                | Instruction::ArraySliceAssign { .. }
                 | Instruction::SetField { .. }
                 | Instruction::SetFieldOffset { .. } => {
                     // Always keep mutations
@@ -884,15 +948,22 @@ impl LoopInvariantCodeMotion {
             Instruction::Copy { dest, .. } => Some(dest),
             Instruction::BinOp { dest, .. } => Some(dest),
             Instruction::UnaryOp { dest, .. } => Some(dest),
+            Instruction::UnitRangeLength { dest, .. } => Some(dest),
+            Instruction::Builtin { dest, .. } => Some(dest),
+            Instruction::Rand { dest, .. } => Some(dest),
+            Instruction::Randn { dest, .. } => Some(dest),
             Instruction::Call { dest, .. } => dest.as_ref(),
             Instruction::CallMulti { .. } => None,
             Instruction::StructNew { dest, .. } => Some(dest),
+            Instruction::ArrayNew { dest, .. } => Some(dest),
+            Instruction::ArraySlice { dest, .. } => Some(dest),
             Instruction::GetIndex { dest, .. } => Some(dest),
             Instruction::GetField { dest, .. } => Some(dest),
             Instruction::GetFieldOffset { dest, .. } => Some(dest),
             Instruction::TypeAssert { dest, .. } => Some(dest),
             Instruction::Phi { dest, .. } => Some(dest),
             Instruction::SetIndex { .. }
+            | Instruction::ArraySliceAssign { .. }
             | Instruction::SetField { .. }
             | Instruction::SetFieldOffset { .. } => None,
         }
@@ -927,21 +998,31 @@ impl LoopInvariantCodeMotion {
 
             // Unary ops are invariant if operand is invariant
             Instruction::UnaryOp { operand, .. } => is_operand_invariant(operand),
+            Instruction::UnitRangeLength { start, stop, .. } => {
+                is_operand_invariant(start) && is_operand_invariant(stop)
+            }
+
+            Instruction::Builtin { .. } | Instruction::Rand { .. } | Instruction::Randn { .. } => {
+                false
+            }
 
             // Calls are generally not invariant (may have side effects)
             Instruction::Call { .. } | Instruction::CallMulti { .. } => false,
 
             // Array/field access may not be invariant (array contents may change)
-            Instruction::GetIndex { array, index, .. } => {
-                is_operand_invariant(array) && is_operand_invariant(index)
+            Instruction::GetIndex { array, indices, .. } => {
+                is_operand_invariant(array) && indices.iter().all(is_operand_invariant)
             }
 
             Instruction::GetField { object, .. } => is_operand_invariant(object),
             Instruction::GetFieldOffset { object, .. } => is_operand_invariant(object),
             Instruction::StructNew { .. } => false,
+            Instruction::ArrayNew { .. } => false,
+            Instruction::ArraySlice { .. } => false,
 
             // These instructions have side effects
             Instruction::SetIndex { .. }
+            | Instruction::ArraySliceAssign { .. }
             | Instruction::SetField { .. }
             | Instruction::SetFieldOffset { .. } => false,
 
@@ -960,6 +1041,7 @@ impl LoopInvariantCodeMotion {
             | Instruction::Copy { .. }
             | Instruction::BinOp { .. }
             | Instruction::UnaryOp { .. }
+            | Instruction::UnitRangeLength { .. }
             | Instruction::GetField { .. }
             | Instruction::GetFieldOffset { .. }
             | Instruction::TypeAssert { .. } => true,
@@ -969,9 +1051,15 @@ impl LoopInvariantCodeMotion {
 
             // These have side effects or depend on control flow
             Instruction::Call { .. }
+            | Instruction::Builtin { .. }
+            | Instruction::Rand { .. }
+            | Instruction::Randn { .. }
             | Instruction::CallMulti { .. }
             | Instruction::StructNew { .. }
+            | Instruction::ArrayNew { .. }
+            | Instruction::ArraySlice { .. }
             | Instruction::SetIndex { .. }
+            | Instruction::ArraySliceAssign { .. }
             | Instruction::SetField { .. }
             | Instruction::SetFieldOffset { .. }
             | Instruction::Phi { .. } => false,

@@ -2642,6 +2642,110 @@ doubled
 }
 
 // ============================================================================
+// Closure Capture and Invocation Tests (Julia 1.12.4 Oracle Coverage)
+// ============================================================================
+// These tests verify AoT compilation and execution of closures with various
+// capture patterns, following the Julia 1.12.4 oracle baseline. Each test
+// compiles to Rust and verifies the generated binary produces the expected
+// output matching upstream Julia 1.12.4.
+
+#[test]
+fn test_aot_closure_execution_noncapturing_lambda() {
+    // Execution: noncapturing lambda returns correct result.
+    let source = r#"
+function noncapturing_lambda_exec()::Int64
+    f = x -> x + 1
+    f(41)
+end
+println(noncapturing_lambda_exec())
+"#;
+    let rust_code = compile_to_rust(source).expect("noncapturing lambda execution must compile");
+    assert_generated_rust_runs_with_stdout(&rust_code, "aot_closure_noncapturing", "42");
+}
+
+#[test]
+fn test_aot_closure_execution_immutable_scalar() {
+    // Execution: immutable scalar capture returns correct value.
+    let source = r#"
+function immutable_scalar_exec()::Int64
+    x = 10
+    f = () -> x
+    f()
+end
+println(immutable_scalar_exec())
+"#;
+    let rust_code = compile_to_rust(source).expect("immutable scalar execution must compile");
+    assert_generated_rust_runs_with_stdout(&rust_code, "aot_closure_immutable_scalar", "10");
+}
+
+#[test]
+fn test_aot_closure_execution_distinct_captures() {
+    // Execution: two closures with distinct captures return correct values.
+    let source = r#"
+function distinct_captures_exec()::Tuple{Int64, Int64}
+    x = 5
+    y = 10
+    f1 = () -> x
+    f2 = () -> y
+    (f1(), f2())
+end
+r1, r2 = distinct_captures_exec()
+println("$r1 $r2")
+"#;
+    let rust_code = compile_to_rust(source).expect("distinct captures execution must compile");
+    assert_generated_rust_runs_with_stdout(&rust_code, "aot_closure_distinct_captures", "5 10");
+}
+
+#[test]
+fn test_aot_closure_execution_curried() {
+    // Execution: curried closure returns correct result.
+    let source = r#"
+function curried_exec()::Int64
+    make_adder = x -> (y -> x + y)
+    add5 = make_adder(5)
+    add5(37)
+end
+println(curried_exec())
+"#;
+    let rust_code = compile_to_rust(source).expect("curried closure execution must compile");
+    assert_generated_rust_runs_with_stdout(&rust_code, "aot_closure_curried", "42");
+}
+
+#[test]
+fn test_aot_closure_execution_nested_return() {
+    // Execution: nested closure return and invoke returns correct result.
+    let source = r#"
+function nested_return_exec()::Int64
+    outer = x -> begin
+        inner = y -> x + y
+        inner
+    end
+    f = outer(100)
+    f(23)
+end
+println(nested_return_exec())
+"#;
+    let rust_code = compile_to_rust(source).expect("nested closure return execution must compile");
+    assert_generated_rust_runs_with_stdout(&rust_code, "aot_closure_nested_return", "123");
+}
+
+#[test]
+fn test_aot_closure_execution_calling_helper() {
+    // Execution: closure calling helper returns correct result.
+    let source = r#"
+function helper_call_exec()::Int64
+    helper(a, b) = a * b
+    x = 7
+    f = () -> helper(x, 6)
+    f()
+end
+println(helper_call_exec())
+"#;
+    let rust_code = compile_to_rust(source).expect("closure calling helper execution must compile");
+    assert_generated_rust_runs_with_stdout(&rust_code, "aot_closure_helper_call", "42");
+}
+
+// ============================================================================
 // Typed Array Tests (Phase 4)
 // ============================================================================
 
@@ -6648,4 +6752,2869 @@ println(rem(Int16(7), Int16(3)))
         "aot_div_family_widths_10131",
         "Int8\n2\nUInt64\n2\nUInt16\n1\n1\n3\n1",
     );
+}
+
+#[path = "aot_e2e_tests/wasm_rng.rs"]
+mod wasm_rng_tests;
+
+mod wasm_backend_tests {
+    use std::fs;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant};
+    use subset_julia_vm::aot::codegen::wasm::emit_module;
+    use subset_julia_vm::aot::codegen::CAbiExport;
+    use subset_julia_vm::aot::ir::{
+        BasicBlock, BinOpKind, ConstValue, Instruction, IrFunction, IrModule, Terminator, VarRef,
+    };
+    use subset_julia_vm::aot::types::StaticType;
+    use subset_julia_vm::aot::{
+        compile_wasm_source, AotBackend, AotError, CompileConfig, WasmImport,
+    };
+
+    fn run_wasm_bytes_node(wasm_bytes: &[u8], javascript: &str) -> String {
+        run_wasm_bytes_node_with_imports(wasm_bytes, "{}", javascript)
+    }
+
+    fn run_wasm_bytes_node_with_imports(
+        wasm_bytes: &[u8],
+        imports: &str,
+        javascript: &str,
+    ) -> String {
+        let dir = tempfile::tempdir().expect("create Wasm test directory");
+        let wasm_path = dir.path().join("module.wasm");
+        let script_path = dir.path().join("run.mjs");
+        fs::write(&wasm_path, wasm_bytes).expect("write Wasm module");
+        fs::write(
+            &script_path,
+            format!(
+                "const bytes = await import('node:fs').then(fs => fs.readFileSync({:?}));\nconst module = await WebAssembly.compile(bytes);\nconst instance = await WebAssembly.instantiate(module, {});\n{}",
+                wasm_path, imports, javascript
+            ),
+        )
+        .expect("write Node Wasm runner");
+        let mut child = Command::new("node")
+            .arg(&script_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("execute Wasm through Node");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll Node Wasm runner") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().expect("terminate hung Node Wasm runner");
+                let _ = child.wait();
+                panic!("Node Wasm runner exceeded five-second deadline");
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let result = child
+            .wait_with_output()
+            .expect("collect Node Wasm runner output");
+        assert!(
+            status.success(),
+            "Node must validate and execute generated Wasm\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        String::from_utf8(result.stdout)
+            .expect("Node stdout should be UTF-8")
+            .trim()
+            .to_string()
+    }
+
+    fn compile_and_run_node(
+        source: &str,
+        function_name: &str,
+        arg_types: Vec<StaticType>,
+        javascript: &str,
+    ) -> String {
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            c_abi_exports: vec![CAbiExport::with_arg_types(
+                function_name,
+                function_name,
+                arg_types,
+            )],
+            ..CompileConfig::default()
+        };
+        let output =
+            compile_wasm_source(source, &config).expect("Wasm AoT compilation should succeed");
+        run_wasm_bytes_node(&output.wasm_bytes, javascript)
+    }
+
+    fn wasm_text(wasm_bytes: &[u8]) -> String {
+        let dir = tempfile::tempdir().expect("create Wasm text directory");
+        let wasm_path = dir.path().join("module.wasm");
+        fs::write(&wasm_path, wasm_bytes).expect("write Wasm text module");
+        let output = Command::new("wasm-tools")
+            .arg("print")
+            .arg(&wasm_path)
+            .output()
+            .expect("print generated Wasm");
+        assert!(
+            output.status.success(),
+            "wasm-tools print failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("generated WAT should be UTF-8")
+    }
+
+    #[test]
+    fn wasm_backend_is_an_explicit_aot_backend() {
+        // Given: the public AoT backend selector.
+        // When: the Wasm backend is selected.
+        let backend = AotBackend::Wasm;
+
+        // Then: selection remains explicit rather than falling back to Rust.
+        assert_eq!(backend, AotBackend::Wasm);
+    }
+
+    #[test]
+    fn wasm_comprehensions_restore_shadowed_and_nested_bindings() {
+        let source = r#"
+function shadowed()::Int64
+    i = 40
+    xs = [i for i in 1:2]
+    return i
+end
+
+function nested_same_name()::Int64
+    i = 70
+    [i for i in 1:2, i in 3:4]
+    return i
+end
+"#;
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            c_abi_exports: ["shadowed", "nested_same_name"]
+                .into_iter()
+                .map(|name| CAbiExport::with_arg_types(name, name, Vec::new()))
+                .collect(),
+            ..CompileConfig::default()
+        };
+        let output = subset_julia_vm::aot::compile_wasm_source(source, &config)
+            .expect("scoped comprehension bindings should compile");
+        let shadowed = run_wasm_bytes_node(
+            &output.wasm_bytes,
+            "console.log(instance.exports.shadowed());",
+        );
+        assert_eq!(shadowed, "40n");
+        let nested = run_wasm_bytes_node(
+            &output.wasm_bytes,
+            "console.log(instance.exports.nested_same_name());",
+        );
+        assert_eq!(nested, "70n");
+    }
+
+    #[test]
+    fn wasm_comprehension_fresh_binding_is_unavailable_afterward() {
+        let source = r#"
+function fresh()::Int64
+    [j for j in 1:2]
+    return j
+end
+"#;
+        let error = subset_julia_vm::aot::compile_wasm_source(
+            source,
+            &CompileConfig {
+                backend: AotBackend::Wasm,
+                c_abi_exports: vec![CAbiExport::with_arg_types("fresh", "fresh", Vec::new())],
+                ..CompileConfig::default()
+            },
+        )
+        .expect_err("a fresh comprehension binding must not escape its scope");
+        assert!(
+            format!("{error:?}").contains("could not resolve variable `j`"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn wasm_descriptor_v2_reports_generated_module_abi_two() {
+        // Given: a generated scalar module with the ABI version export.
+        let source = "answer()::Int64 = 42";
+
+        // When: Node reads the generated-module ABI version.
+        let value = compile_and_run_node(
+            source,
+            "answer",
+            Vec::new(),
+            "console.log(instance.exports.__sjulia_wasm_abi_version());",
+        );
+
+        // Then: descriptor ABI v2 is the only accepted generated-module contract.
+        assert_eq!(value, "2");
+    }
+
+    #[test]
+    fn wasm_descriptor_v2_exports_checked_allocation_lifetimes() {
+        // Given: any pure generated Wasm module.
+        let source = "answer()::Int64 = 42";
+
+        // When: Node exercises allocation, reuse, malformed frees, and descriptor drops.
+        let value = compile_and_run_node(
+            source,
+            "answer",
+            Vec::new(),
+            r#"
+const { memory, __sjulia_alloc: alloc, __sjulia_free: free, __sjulia_drop: drop } = instance.exports;
+if (![alloc, free, drop].every(value => typeof value === "function")) throw new Error("missing lifetime exports");
+const traps = action => { try { action(); return 0; } catch (error) { return Number(error instanceof WebAssembly.RuntimeError); } };
+const invalidAllocations = [alloc(0n, 8), traps(() => alloc(-1n, 8)), traps(() => alloc(1n, 0)), traps(() => alloc(1n, 3)), traps(() => alloc(1n, -8))];
+const first = alloc(32n, 16);
+let memoryBytes = new Uint8Array(memory.buffer);
+memoryBytes[first] = 0x5a;
+free(first);
+const reused = alloc(16n, 16);
+const badFreeTraps = [traps(() => free(reused + 1)), traps(() => free(32)), traps(() => free(memory.buffer.byteLength)), traps(() => free(0))];
+free(reused);
+const doubleFree = traps(() => free(reused));
+
+const descriptor = alloc(56n, 8);
+const data = alloc(4n, 1);
+let view = new DataView(memory.buffer);
+view.setUint32(descriptor, 2, true);
+view.setUint32(descriptor + 4, 1, true);
+view.setUint32(descriptor + 8, 1, true);
+view.setUint32(descriptor + 12, 1, true);
+view.setUint32(descriptor + 16, 0, true);
+view.setUint32(descriptor + 20, 1, true);
+view.setUint32(descriptor + 24, data, true);
+view.setUint32(descriptor + 28, 0, true);
+view.setBigUint64(descriptor + 32, 4n, true);
+view.setBigUint64(descriptor + 40, 4n, true);
+view.setBigInt64(descriptor + 48, 1n, true);
+drop(descriptor);
+view = new DataView(memory.buffer);
+const cleared = view.getUint32(descriptor + 4, true) === 0 && view.getUint32(descriptor + 24, true) === 0;
+const doubleDrop = traps(() => drop(descriptor));
+
+const hostDescriptor = 32;
+const hostData = 128;
+view.setUint32(hostDescriptor, 2, true);
+view.setUint32(hostDescriptor + 4, 0, true);
+view.setUint32(hostDescriptor + 8, 1, true);
+view.setUint32(hostDescriptor + 12, 1, true);
+view.setUint32(hostDescriptor + 16, 0, true);
+view.setUint32(hostDescriptor + 20, 1, true);
+view.setUint32(hostDescriptor + 24, hostData, true);
+view.setUint32(hostDescriptor + 28, 0, true);
+view.setBigUint64(hostDescriptor + 32, 1n, true);
+view.setBigUint64(hostDescriptor + 40, 1n, true);
+view.setBigInt64(hostDescriptor + 48, 1n, true);
+new Uint8Array(memory.buffer)[hostData] = 77;
+drop(hostDescriptor);
+const hostPreserved = new Uint8Array(memory.buffer)[hostData] === 77;
+
+const zeroOwnedDescriptor = alloc(56n, 8);
+view.setUint32(zeroOwnedDescriptor, 2, true);
+view.setUint32(zeroOwnedDescriptor + 4, 1, true);
+view.setUint32(zeroOwnedDescriptor + 8, 1, true);
+view.setUint32(zeroOwnedDescriptor + 12, 1, true);
+view.setUint32(zeroOwnedDescriptor + 16, 0, true);
+view.setUint32(zeroOwnedDescriptor + 20, 1, true);
+view.setUint32(zeroOwnedDescriptor + 24, 0, true);
+view.setUint32(zeroOwnedDescriptor + 28, 0, true);
+view.setBigUint64(zeroOwnedDescriptor + 32, 0n, true);
+view.setBigUint64(zeroOwnedDescriptor + 40, 0n, true);
+view.setBigInt64(zeroOwnedDescriptor + 48, 1n, true);
+const zeroDropTrap = traps(() => drop(zeroOwnedDescriptor));
+view = new DataView(memory.buffer);
+const zeroOwnedCleared = view.getUint32(zeroOwnedDescriptor + 4, true) === 0 && view.getUint32(zeroOwnedDescriptor + 24, true) === 0;
+const zeroSecondDrop = traps(() => drop(zeroOwnedDescriptor));
+
+const zeroHostDescriptor = alloc(56n, 8);
+view.setUint32(zeroHostDescriptor, 2, true);
+view.setUint32(zeroHostDescriptor + 4, 0, true);
+view.setUint32(zeroHostDescriptor + 8, 1, true);
+view.setUint32(zeroHostDescriptor + 12, 1, true);
+view.setUint32(zeroHostDescriptor + 16, 0, true);
+view.setUint32(zeroHostDescriptor + 20, 1, true);
+view.setUint32(zeroHostDescriptor + 24, hostData, true);
+view.setUint32(zeroHostDescriptor + 28, 0, true);
+view.setBigUint64(zeroHostDescriptor + 32, 0n, true);
+view.setBigUint64(zeroHostDescriptor + 40, 0n, true);
+view.setBigInt64(zeroHostDescriptor + 48, 1n, true);
+const zeroHostDropTrap = traps(() => drop(zeroHostDescriptor));
+const zeroHostPreserved = view.getUint32(zeroHostDescriptor + 4, true) === 0 && view.getUint32(zeroHostDescriptor + 24, true) === hostData;
+
+const malformedZeroPointer = alloc(56n, 8);
+view.setUint32(malformedZeroPointer, 2, true);
+view.setUint32(malformedZeroPointer + 4, 1, true);
+view.setUint32(malformedZeroPointer + 8, 1, true);
+view.setUint32(malformedZeroPointer + 12, 1, true);
+view.setUint32(malformedZeroPointer + 16, 0, true);
+view.setUint32(malformedZeroPointer + 20, 1, true);
+view.setUint32(malformedZeroPointer + 24, 127, true);
+view.setUint32(malformedZeroPointer + 28, 1, true);
+view.setBigUint64(malformedZeroPointer + 32, 0n, true);
+view.setBigUint64(malformedZeroPointer + 40, 1n, true);
+view.setBigInt64(malformedZeroPointer + 48, 1n, true);
+const malformedZeroPointerTrap = traps(() => drop(malformedZeroPointer));
+
+const malformedZeroShape = alloc(56n, 8);
+view.setUint32(malformedZeroShape, 2, true);
+view.setUint32(malformedZeroShape + 4, 0, true);
+view.setUint32(malformedZeroShape + 8, 1, true);
+view.setUint32(malformedZeroShape + 12, 1, true);
+view.setUint32(malformedZeroShape + 16, 0, true);
+view.setUint32(malformedZeroShape + 20, 1, true);
+view.setUint32(malformedZeroShape + 24, 0, true);
+view.setUint32(malformedZeroShape + 28, 0, true);
+view.setBigUint64(malformedZeroShape + 32, 0n, true);
+view.setBigUint64(malformedZeroShape + 40, 1n, true);
+view.setBigInt64(malformedZeroShape + 48, 1n, true);
+const malformedZeroShapeTrap = traps(() => drop(malformedZeroShape));
+
+const beforeGrowth = memory.buffer.byteLength;
+const large = alloc(BigInt(beforeGrowth), 8);
+memoryBytes = new Uint8Array(memory.buffer);
+memoryBytes[large + beforeGrowth - 1] = 0xa5;
+const grew = memory.buffer.byteLength > beforeGrowth && memoryBytes[large + beforeGrowth - 1] === 0xa5;
+free(large);
+const exhaustion = [];
+for (;;) {
+  const pointer = alloc(1048576n, 8);
+  if (pointer === 0) break;
+  exhaustion.push(pointer);
+}
+const oomIsZero = exhaustion.length > 0 && alloc(1048576n, 8) === 0;
+console.log(JSON.stringify({ invalidAllocations, aligned: first % 16 === 0, reused: reused === first, badFreeTraps, doubleFree, cleared, doubleDrop, hostPreserved, zeroDropTrap, zeroOwnedCleared, zeroSecondDrop, zeroHostDropTrap, zeroHostPreserved, malformedZeroPointerTrap, malformedZeroShapeTrap, grew, oomIsZero }));
+"#,
+        );
+
+        // Then: OOM alone returns zero and every ownership violation traps.
+        assert_eq!(
+            value,
+            r#"{"invalidAllocations":[0,1,1,1,1],"aligned":true,"reused":true,"badFreeTraps":[1,1,1,1],"doubleFree":1,"cleared":true,"doubleDrop":1,"hostPreserved":true,"zeroDropTrap":0,"zeroOwnedCleared":true,"zeroSecondDrop":1,"zeroHostDropTrap":0,"zeroHostPreserved":true,"malformedZeroPointerTrap":1,"malformedZeroShapeTrap":1,"grew":true,"oomIsZero":true}"#
+        );
+    }
+
+    #[test]
+    fn wasm_rejects_all_lifetime_helper_name_collisions() {
+        // Given: each generated-module lifetime helper name used by Julia source.
+        for name in ["__sjulia_alloc", "__sjulia_free", "__sjulia_drop"] {
+            let source = format!("{name}()::Int64 = 1");
+
+            // When: the canonical backend validates the generated namespace.
+            let error = compile_wasm_source(
+                &source,
+                &CompileConfig {
+                    backend: AotBackend::Wasm,
+                    c_abi_exports: vec![CAbiExport::with_arg_types(name, name, Vec::new())],
+                    ..CompileConfig::default()
+                },
+            )
+            .expect_err("lifetime helper collisions must be rejected");
+
+            // Then: collision is a typed unsupported diagnostic.
+            assert!(matches!(error, AotError::UnsupportedInstruction(_)));
+        }
+    }
+
+    #[test]
+    fn wasm_descriptor_v2_reads_rank_two_uint8_with_inline_metadata() {
+        // Given: a rank-2 UInt8 function and non-square column-major host storage.
+        let source = "function update_matrix!(bytes::Matrix{UInt8}, row::Int64, column::Int64)::Int64\nbytes[row, column] = UInt8(99)\nreturn Int64(bytes[row, column]) + length(bytes)\nend";
+
+        // When: Node supplies the v2 header followed by inline dimensions and strides.
+        let value = compile_and_run_node(
+            source,
+            "update_matrix!",
+            vec![
+                StaticType::Array {
+                    element: Box::new(StaticType::U8),
+                    ndims: Some(2),
+                },
+                StaticType::I64,
+                StaticType::I64,
+            ],
+            "const memory = instance.exports.memory; const view = new DataView(memory.buffer); const descriptor = 32; const ptr = 128; const input = new Uint8Array(memory.buffer, ptr, 6); input.set([11, 12, 21, 22, 31, 32]); view.setUint32(descriptor, 2, true); view.setUint32(descriptor + 4, 0, true); view.setUint32(descriptor + 8, 1, true); view.setUint32(descriptor + 12, 1, true); view.setUint32(descriptor + 16, 0, true); view.setUint32(descriptor + 20, 2, true); view.setUint32(descriptor + 24, ptr, true); view.setUint32(descriptor + 28, 0, true); view.setBigUint64(descriptor + 32, 6n, true); view.setBigUint64(descriptor + 40, 2n, true); view.setBigInt64(descriptor + 48, 1n, true); view.setBigUint64(descriptor + 56, 3n, true); view.setBigInt64(descriptor + 64, 2n, true); const result = instance.exports[\"update_matrix!\"](descriptor, 2n, 3n); console.log(`${result}:${Array.from(input).join(',')}`);",
+        );
+
+        // Then: Julia one-based rank-aware addressing selects column three, row two.
+        assert_eq!(value, "105:11,12,21,22,31,99");
+    }
+
+    #[test]
+    fn wasm_primitive_array_assignment_converts_to_element_type() {
+        // Given: Julia assignments whose RHS types differ from the array element types.
+        let source = r#"
+function write_u8!(value::Vector{UInt8}, input::Int64)::UInt8
+    assigned = (value[1] = input)
+    return assigned
+end
+function write_bool!(value::Vector{Bool}, input::Int64)::Bool
+    assigned = (value[1] = input)
+    return assigned
+end
+read_bool(value::Vector{Bool})::Bool = value[1]
+"#;
+        let oracle = Command::new("julia")
+            .args([
+                "--startup-file=no",
+                "-e",
+                &format!(
+                    "{source}\nu=UInt8[0]; b=Bool[false]; println((write_u8!(u, 255), u[1], write_bool!(b, 1), b[1]))"
+                ),
+            ])
+            .output()
+            .expect("run upstream Julia assignment conversion oracle");
+        assert!(
+            oracle.status.success(),
+            "{}",
+            String::from_utf8_lossy(&oracle.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&oracle.stdout).trim(),
+            "(0xff, 0xff, true, true)"
+        );
+
+        // When: generated Wasm stores through host-provided ABI v2 descriptors.
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            c_abi_exports: vec![
+                CAbiExport::with_arg_types(
+                    "write_u8!",
+                    "write_u8!",
+                    vec![
+                        StaticType::Array {
+                            element: Box::new(StaticType::U8),
+                            ndims: Some(1),
+                        },
+                        StaticType::I64,
+                    ],
+                ),
+                CAbiExport::with_arg_types(
+                    "write_bool!",
+                    "write_bool!",
+                    vec![
+                        StaticType::Array {
+                            element: Box::new(StaticType::Bool),
+                            ndims: Some(1),
+                        },
+                        StaticType::I64,
+                    ],
+                ),
+                CAbiExport::with_arg_types(
+                    "read_bool",
+                    "read_bool",
+                    vec![StaticType::Array {
+                        element: Box::new(StaticType::Bool),
+                        ndims: Some(1),
+                    }],
+                ),
+            ],
+            ..CompileConfig::default()
+        };
+        let output = compile_wasm_source(source, &config)
+            .expect("primitive assignment conversions should compile");
+        let value = run_wasm_bytes_node(
+            &output.wasm_bytes,
+            r#"
+const { memory } = instance.exports;
+const view = new DataView(memory.buffer);
+const write = (descriptor, pointer, tag) => {
+  view.setUint32(descriptor, 2, true);
+  view.setUint32(descriptor + 4, 0, true);
+  view.setUint32(descriptor + 8, tag, true);
+  view.setUint32(descriptor + 12, 1, true);
+  view.setUint32(descriptor + 16, 0, true);
+  view.setUint32(descriptor + 20, 1, true);
+  view.setUint32(descriptor + 24, pointer, true);
+  view.setUint32(descriptor + 28, 0, true);
+  view.setBigUint64(descriptor + 32, 1n, true);
+  view.setBigUint64(descriptor + 40, 1n, true);
+  view.setBigInt64(descriptor + 48, 1n, true);
+};
+write(32, 160, 1);
+write(88, 168, 11);
+const u8 = instance.exports["write_u8!"](32, 255n);
+const bool = instance.exports["write_bool!"](88, 1n);
+const dataBytes = new Uint8Array(memory.buffer);
+dataBytes[168] = 255;
+const normalizedBool = instance.exports.read_bool(88);
+console.log(`${u8}:${dataBytes[160]}:${bool}:${normalizedBool}`);
+"#,
+        );
+
+        // Then: stores use the static element type and assignments return converted values.
+        assert_eq!(value, "255:255:1:1");
+    }
+
+    #[test]
+    fn wasm_indexes_primitive_arrays_across_supported_ranks_and_strides() {
+        // Given: every primitive element type and representative ranks through eight.
+        let source = r#"
+function u8_scalar()::Array{UInt8,0}
+    value = zeros(UInt8)
+    value[] = UInt8(0xa5)
+    return value
+end
+function f32_rank3()::Array{Float32,3}
+    value = zeros(Float32, 2, 1, 2)
+    value[2, 1, 2] = Float32(3.5)
+    return value
+end
+function f64_matrix()::Matrix{Float64}
+    value = zeros(Float64, 2, 3)
+    value[1, 3] = 6.25
+    return value
+end
+function i32_vector()::Vector{Int32}
+    value = zeros(Int32, 3)
+    value[3] = Int32(-17)
+    return value
+end
+function i64_rank5()::Array{Int64,5}
+    value = zeros(Int64, 1, 2, 1, 2, 1)
+    value[1, 2, 1, 2, 1] = Int64(72623859790382856)
+    return value
+end
+function bool_rank8()::Array{Bool,8}
+    value = zeros(Bool, 1, 1, 1, 1, 1, 1, 1, 2)
+    value[1, 1, 1, 1, 1, 1, 1, 2] = true
+    return value
+end
+u8_read(value::Array{UInt8,0})::UInt8 = value[]
+function f32_write!(value::Array{Float32,3}, input::Float32)::Float32
+    assigned = (value[2, 1, 2] = input)
+    return assigned
+end
+function f64_write!(value::Matrix{Float64}, input::Float64)::Float64
+    assigned = (value[2, 3] = input)
+    return assigned
+end
+function i32_write!(value::Vector{Int32}, input::Int32)::Int32
+    assigned = (value[3] = input)
+    return assigned
+end
+function i64_write!(value::Array{Int64,5}, input::Int64)::Int64
+    assigned = (value[1, 2, 1, 2, 1] = input)
+    return assigned
+end
+function bool_write!(value::Array{Bool,8}, input::Bool)::Bool
+    assigned = (value[1, 1, 1, 1, 1, 1, 1, 2] = input)
+    return assigned
+end
+"#;
+        let oracle = Command::new("julia")
+            .args([
+                "--startup-file=no",
+                "-e",
+                &format!(
+                    "{source}\nprintln((u8_scalar()[], f32_rank3()[2,1,2], f64_matrix()[1,3], i32_vector()[3], i64_rank5()[1,2,1,2,1], bool_rank8()[1,1,1,1,1,1,1,2]))"
+                ),
+            ])
+            .output()
+            .expect("run upstream Julia arbitrary-rank indexing oracle");
+        assert!(
+            oracle.status.success(),
+            "{}",
+            String::from_utf8_lossy(&oracle.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&oracle.stdout).trim(),
+            "(0xa5, 3.5f0, 6.25, -17, 72623859790382856, true)"
+        );
+        let array = |element, rank| StaticType::Array {
+            element: Box::new(element),
+            ndims: Some(rank),
+        };
+        let exports = [
+            ("u8_scalar", vec![]),
+            ("f32_rank3", vec![]),
+            ("f64_matrix", vec![]),
+            ("i32_vector", vec![]),
+            ("i64_rank5", vec![]),
+            ("bool_rank8", vec![]),
+            ("u8_read", vec![array(StaticType::U8, 0)]),
+            (
+                "f32_write!",
+                vec![array(StaticType::F32, 3), StaticType::F32],
+            ),
+            (
+                "f64_write!",
+                vec![array(StaticType::F64, 2), StaticType::F64],
+            ),
+            (
+                "i32_write!",
+                vec![array(StaticType::I32, 1), StaticType::I32],
+            ),
+            (
+                "i64_write!",
+                vec![array(StaticType::I64, 5), StaticType::I64],
+            ),
+            (
+                "bool_write!",
+                vec![array(StaticType::Bool, 8), StaticType::Bool],
+            ),
+        ];
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            c_abi_exports: exports
+                .into_iter()
+                .map(|(name, args)| CAbiExport::with_arg_types(name, name, args))
+                .collect(),
+            ..CompileConfig::default()
+        };
+
+        // When: Node reads module allocations, grows memory, and mutates strided host views.
+        let output = compile_wasm_source(source, &config)
+            .expect("arbitrary-rank primitive indexing should compile");
+        let javascript = r#"
+const e = instance.exports;
+const imports = WebAssembly.Module.imports(module).length;
+const decode = pointer => {
+  const view = new DataView(e.memory.buffer);
+  const rank = view.getUint32(pointer + 20, true);
+  return {
+    pointer,
+    data: view.getUint32(pointer + 24, true),
+    rank,
+    dims: Array.from({ length: rank }, (_, axis) => view.getBigUint64(pointer + 40 + axis * 16, true)),
+    strides: Array.from({ length: rank }, (_, axis) => view.getBigInt64(pointer + 48 + axis * 16, true)),
+  };
+};
+const made = [e.u8_scalar(), e.f32_rank3(), e.f64_matrix(), e.i32_vector(), e.i64_rank5(), e.bool_rank8()];
+const beforeGrowth = e.memory.buffer;
+e.__sjulia_alloc(BigInt(beforeGrowth.byteLength), 8);
+const refreshed = made.map(decode);
+const moduleBytes = [
+  new DataView(e.memory.buffer).getUint8(refreshed[0].data),
+  new DataView(e.memory.buffer).getFloat32(refreshed[1].data + 12, true),
+  new DataView(e.memory.buffer).getFloat64(refreshed[2].data + 32, true),
+  new DataView(e.memory.buffer).getInt32(refreshed[3].data + 8, true),
+  new DataView(e.memory.buffer).getBigInt64(refreshed[4].data + 24, true).toString(),
+  new DataView(e.memory.buffer).getUint8(refreshed[5].data + 1),
+];
+let nextDescriptor = 32;
+let nextData = 2048;
+const host = (tag, bytes, dims, strides) => {
+  const descriptor = nextDescriptor;
+  const data = nextData;
+  nextDescriptor += 176;
+  nextData += 256;
+  const view = new DataView(e.memory.buffer);
+  view.setUint32(descriptor, 2, true);
+  view.setUint32(descriptor + 4, 0, true);
+  view.setUint32(descriptor + 8, tag, true);
+  view.setUint32(descriptor + 12, bytes, true);
+  view.setUint32(descriptor + 16, 0, true);
+  view.setUint32(descriptor + 20, dims.length, true);
+  view.setUint32(descriptor + 24, data, true);
+  view.setUint32(descriptor + 28, 0, true);
+  view.setBigUint64(descriptor + 32, dims.reduce((product, dim) => product * dim, 1n), true);
+  dims.forEach((dim, axis) => {
+    view.setBigUint64(descriptor + 40 + axis * 16, dim, true);
+    view.setBigInt64(descriptor + 48 + axis * 16, strides[axis], true);
+  });
+  return { descriptor, data };
+};
+const f32 = host(9, 4, [2n, 1n, 2n], [1n, 2n, 3n]);
+const f64 = host(10, 8, [2n, 3n], [1n, 3n]);
+const i32 = host(6, 4, [3n], [2n]);
+const i64 = host(8, 8, [1n, 2n, 1n, 2n, 1n], [0n, 1n, 0n, 2n, 0n]);
+const bool = host(11, 1, [1n, 1n, 1n, 1n, 1n, 1n, 1n, 2n], [0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n]);
+e["f32_write!"](f32.descriptor, 9.5);
+e["f64_write!"](f64.descriptor, -12.25);
+e["i32_write!"](i32.descriptor, -123);
+e["i64_write!"](i64.descriptor, 0x102030405060708n);
+e["bool_write!"](bool.descriptor, 1);
+const hostBytes = [
+  new DataView(e.memory.buffer).getFloat32(f32.data + 16, true),
+  new DataView(e.memory.buffer).getFloat64(f64.data + 56, true),
+  new DataView(e.memory.buffer).getInt32(i32.data + 16, true),
+  new DataView(e.memory.buffer).getBigInt64(i64.data + 24, true).toString(),
+  new DataView(e.memory.buffer).getUint8(bool.data),
+];
+console.log(JSON.stringify({ imports, grew: beforeGrowth.byteLength === 0, moduleBytes, hostBytes, scalar: e.u8_read(made[0]) }));
+"#;
+        let values = (0..3)
+            .map(|_| run_wasm_bytes_node(&output.wasm_bytes, javascript))
+            .collect::<Vec<_>>();
+
+        // Then: one-based checked strides select exact bytes for module and host arrays.
+        let expected = r#"{"imports":0,"grew":true,"moduleBytes":[165,3.5,6.25,-17,"72623859790382856",1],"hostBytes":[9.5,-12.25,-123,"72623859790382856",1],"scalar":165}"#;
+        assert_eq!(values, vec![expected, expected, expected]);
+    }
+
+    #[test]
+    fn wasm_copies_inclusive_primitive_array_slices() {
+        // Given: crop-like and mixed scalar/range indexing over a rank-two array.
+        let source = r#"
+crop(value::Matrix{Int32})::Matrix{Int32} = value[1:2, 2:3]
+row(value::Matrix{Int32})::Vector{Int32} = value[2, 1:3]
+empty(value::Matrix{Int32})::Matrix{Int32} = value[2:1, 1:3]
+"#;
+        let oracle = Command::new("julia")
+            .args([
+                "--startup-file=no",
+                "-e",
+                &format!(
+                    "{source}\nA=reshape(Int32.(1:6), 2, 3); println((size(crop(A)), vec(crop(A)), size(row(A)), row(A), size(empty(A))))"
+                ),
+            ])
+            .output()
+            .expect("run upstream Julia slicing oracle");
+        assert!(
+            oracle.status.success(),
+            "{}",
+            String::from_utf8_lossy(&oracle.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&oracle.stdout).trim(),
+            "((2, 2), Int32[3, 4, 5, 6], (3,), Int32[2, 4, 6], (0, 3))"
+        );
+        let matrix = StaticType::Array {
+            element: Box::new(StaticType::I32),
+            ndims: Some(2),
+        };
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            c_abi_exports: ["crop", "row", "empty"]
+                .into_iter()
+                .map(|name| CAbiExport::with_arg_types(name, name, vec![matrix.clone()]))
+                .collect(),
+            ..CompileConfig::default()
+        };
+
+        // When: generated Wasm copies each result into module-owned ABI v2 storage.
+        let output = compile_wasm_source(source, &config)
+            .expect("inclusive primitive array slices should compile");
+        let javascript = r#"
+const e = instance.exports;
+const view = new DataView(e.memory.buffer);
+const descriptor = 32;
+const data = 160;
+view.setUint32(descriptor, 2, true);
+view.setUint32(descriptor + 4, 0, true);
+view.setUint32(descriptor + 8, 6, true);
+view.setUint32(descriptor + 12, 4, true);
+view.setUint32(descriptor + 16, 0, true);
+view.setUint32(descriptor + 20, 2, true);
+view.setUint32(descriptor + 24, data, true);
+view.setUint32(descriptor + 28, 0, true);
+view.setBigUint64(descriptor + 32, 6n, true);
+view.setBigUint64(descriptor + 40, 2n, true);
+view.setBigInt64(descriptor + 48, 1n, true);
+view.setBigUint64(descriptor + 56, 3n, true);
+view.setBigInt64(descriptor + 64, 2n, true);
+new Int32Array(e.memory.buffer, data, 6).set([1, 2, 3, 4, 5, 6]);
+const decode = pointer => {
+  const current = new DataView(e.memory.buffer);
+  const rank = current.getUint32(pointer + 20, true);
+  const count = Number(current.getBigUint64(pointer + 32, true));
+  const start = current.getUint32(pointer + 24, true);
+  return {
+    flags: current.getUint32(pointer + 4, true),
+    rank,
+    dims: Array.from({length: rank}, (_, axis) => Number(current.getBigUint64(pointer + 40 + axis * 16, true))),
+    strides: Array.from({length: rank}, (_, axis) => Number(current.getBigInt64(pointer + 48 + axis * 16, true))),
+    values: Array.from(new Int32Array(e.memory.buffer, start, count)),
+  };
+};
+const results = [e.crop(descriptor), e.row(descriptor), e.empty(descriptor)];
+const beforeGrowth = e.memory.buffer;
+e.__sjulia_alloc(BigInt(beforeGrowth.byteLength), 8);
+const decoded = results.map(decode);
+results.forEach(e.__sjulia_drop);
+console.log(JSON.stringify({ imports: WebAssembly.Module.imports(module).length, grew: beforeGrowth.byteLength === 0, decoded }));
+"#;
+        let values = (0..3)
+            .map(|_| run_wasm_bytes_node(&output.wasm_bytes, javascript))
+            .collect::<Vec<_>>();
+
+        // Then: range axes are preserved, scalar axes drop, and empty ranges stay empty.
+        assert_eq!(
+            values,
+            vec![
+                r#"{"imports":0,"grew":true,"decoded":[{"flags":1,"rank":2,"dims":[2,2],"strides":[1,2],"values":[3,4,5,6]},{"flags":1,"rank":1,"dims":[3],"strides":[1],"values":[2,4,6]},{"flags":1,"rank":2,"dims":[0,3],"strides":[1,0],"values":[]}]}"#;
+                3
+            ]
+        );
+    }
+
+    #[test]
+    fn wasm_assigns_primitive_array_slices_transactionally() {
+        // Given: scalar fill, overlapping array sources, exact aliasing, and invalid writes.
+        let source = r#"
+function fill_slice!(value::Vector{Int32}, input::Int32)::Int32
+    value[2:4] = input
+    return value[2]
+end
+function copy_forward!(value::Vector{Int32})::Int32
+    value[2:5] = value[1:4]
+    return value[4]
+end
+function copy_backward!(value::Vector{Int32})::Int32
+    value[1:4] = value[2:5]
+    return value[1]
+end
+function copy_alias!(value::Vector{Int32})::Int32
+    value[1:5] = value[1:5]
+    return value[5]
+end
+function shape_mismatch!(value::Matrix{Int32}, input::Vector{Int32})::Int32
+    value[1:2, 1:2] = input
+    return value[1,1]
+end
+function oob!(value::Vector{Int32}, input::Int32)::Int32
+    value[0:2] = input
+    return value[1]
+end
+"#;
+        let vector = StaticType::Array {
+            element: Box::new(StaticType::I32),
+            ndims: Some(1),
+        };
+        let matrix = StaticType::Array {
+            element: Box::new(StaticType::I32),
+            ndims: Some(2),
+        };
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            c_abi_exports: vec![
+                CAbiExport::with_arg_types(
+                    "fill_slice!",
+                    "fill_slice!",
+                    vec![vector.clone(), StaticType::I32],
+                ),
+                CAbiExport::with_arg_types("copy_forward!", "copy_forward!", vec![vector.clone()]),
+                CAbiExport::with_arg_types(
+                    "copy_backward!",
+                    "copy_backward!",
+                    vec![vector.clone()],
+                ),
+                CAbiExport::with_arg_types("copy_alias!", "copy_alias!", vec![vector.clone()]),
+                CAbiExport::with_arg_types(
+                    "shape_mismatch!",
+                    "shape_mismatch!",
+                    vec![matrix, vector.clone()],
+                ),
+                CAbiExport::with_arg_types("oob!", "oob!", vec![vector, StaticType::I32]),
+            ],
+            ..CompileConfig::default()
+        };
+
+        // When: Node executes valid and trapping assignments over host descriptors.
+        let output = compile_wasm_source(source, &config)
+            .expect("primitive slice assignment should compile");
+        let javascript = r#"
+const e = instance.exports;
+const write = (descriptor, data, dims, flags = 0) => {
+  const view = new DataView(e.memory.buffer);
+  view.setUint32(descriptor, 2, true);
+  view.setUint32(descriptor + 4, flags, true);
+  view.setUint32(descriptor + 8, 6, true);
+  view.setUint32(descriptor + 12, 4, true);
+  view.setUint32(descriptor + 16, 0, true);
+  view.setUint32(descriptor + 20, dims.length, true);
+  view.setUint32(descriptor + 24, data, true);
+  view.setUint32(descriptor + 28, 0, true);
+  view.setBigUint64(descriptor + 32, dims.reduce((a, b) => a * b, 1n), true);
+  let stride = 1n;
+  dims.forEach((dim, axis) => {
+    view.setBigUint64(descriptor + 40 + axis * 16, dim, true);
+    view.setBigInt64(descriptor + 48 + axis * 16, stride, true);
+    stride *= dim;
+  });
+};
+const values = descriptor => {
+  const view = new DataView(e.memory.buffer);
+  return Array.from(new Int32Array(e.memory.buffer, view.getUint32(descriptor + 24, true), Number(view.getBigUint64(descriptor + 32, true))));
+};
+const reset = (descriptor, data) => { write(descriptor, data, [5n]); new Int32Array(e.memory.buffer, data, 5).set([1,2,3,4,5]); };
+const traps = action => { try { action(); return 0; } catch (error) { return Number(error instanceof WebAssembly.RuntimeError); } };
+reset(32, 1024); e["fill_slice!"](32, 9); const fill = values(32);
+reset(32, 1024); e["copy_forward!"](32); const forward = values(32);
+reset(32, 1024); e["copy_backward!"](32); const backward = values(32);
+reset(32, 1024); e["copy_alias!"](32); const alias = values(32);
+reset(32, 1024); write(96, 1100, [5n], 2); new Int32Array(e.memory.buffer, 1100, 5).set([1,2,3,4,5]);
+const readonlyTrap = traps(() => e["fill_slice!"](96, 9)); const readonly = values(96);
+reset(32, 1024); const oobTrap = traps(() => e["oob!"](32, 9)); const oob = values(32);
+write(160, 1200, [2n,2n]); new Int32Array(e.memory.buffer, 1200, 4).set([7,8,9,10]);
+write(232, 1300, [3n]); new Int32Array(e.memory.buffer, 1300, 3).set([1,2,3]);
+const shapeTrap = traps(() => e["shape_mismatch!"](160, 232)); const shape = values(160);
+reset(32, 1024);
+for (;;) { if (e.__sjulia_alloc(1048576n, 8) === 0) break; }
+for (;;) { if (e.__sjulia_alloc(16n, 8) === 0) break; }
+const oomTrap = traps(() => e["copy_forward!"](32)); const oom = values(32);
+console.log(JSON.stringify({ imports: WebAssembly.Module.imports(module).length, fill, forward, backward, alias, readonlyTrap, readonly, oobTrap, oob, shapeTrap, shape, oomTrap, oom }));
+"#;
+        let values = (0..3)
+            .map(|_| run_wasm_bytes_node(&output.wasm_bytes, javascript))
+            .collect::<Vec<_>>();
+
+        // Then: all failures preserve sentinels and overlap behaves like a temporary copy.
+        let expected = r#"{"imports":0,"fill":[1,9,9,9,5],"forward":[1,1,2,3,4],"backward":[2,3,4,5,5],"alias":[1,2,3,4,5],"readonlyTrap":1,"readonly":[1,2,3,4,5],"oobTrap":1,"oob":[1,2,3,4,5],"shapeTrap":1,"shape":[7,8,9,10],"oomTrap":1,"oom":[1,2,3,4,5]}"#;
+        assert_eq!(values, vec![expected, expected, expected]);
+    }
+
+    #[test]
+    fn wasm_allocates_primitive_arrays_and_reports_julia_shapes() {
+        // Given: Julia's rank-0 through rank-8 primitive allocation and shape contract.
+        let source = r#"
+u8_scalar()::Array{UInt8,0} = ones(UInt8)
+f32_empty()::Array{Float32,3} = zeros(Float32, 2, 0, 3)
+f32_scalar()::Array{Float32,0} = ones(Float32)
+f64_matrix()::Matrix{Float64} = ones(Float64, 2, 3)
+i32_vector()::Vector{Int32} = zeros(Int32, 5)
+i64_rank5()::Array{Int64,5} = ones(Int64, 1, 2, 1, 3, 1)
+bool_rank8()::Array{Bool,8} = ones(Bool, 1, 1, 1, 1, 1, 1, 1, 2)
+growth_array(n::Int64)::Vector{UInt8} = ones(UInt8, n)
+dynamic_matrix(rows::Int64, columns::Int64)::Matrix{Float64} = zeros(Float64, rows, columns)
+array_length(value::Array{Int64,5})::Int64 = length(value)
+array_ndims(value::Array{Int64,5})::Int64 = ndims(value)
+array_axis(value::Array{Int64,5}, axis::Int64)::Int64 = size(value, axis)
+array_size(value::Array{Int64,5})::NTuple{5,Int64} = size(value)
+"#;
+        let oracle = Command::new("julia")
+            .args([
+                "--startup-file=no",
+                "-e",
+                &format!(
+                    "{source}\nA=i64_rank5(); println((size(u8_scalar()), size(f32_empty()), size(f64_matrix()), size(i32_vector()), size(A), size(bool_rank8()), length(A), ndims(A), size(A, 4), size(A, 8)))"
+                ),
+            ])
+            .output()
+            .expect("run upstream Julia array oracle");
+        assert!(
+            oracle.status.success(),
+            "{}",
+            String::from_utf8_lossy(&oracle.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&oracle.stdout).trim(),
+            "((), (2, 0, 3), (2, 3), (5,), (1, 2, 1, 3, 1), (1, 1, 1, 1, 1, 1, 1, 2), 6, 5, 3, 1)"
+        );
+        let exports = [
+            ("u8_scalar", Vec::new()),
+            ("f32_empty", Vec::new()),
+            ("f32_scalar", Vec::new()),
+            ("f64_matrix", Vec::new()),
+            ("i32_vector", Vec::new()),
+            ("i64_rank5", Vec::new()),
+            ("bool_rank8", Vec::new()),
+            ("growth_array", vec![StaticType::I64]),
+            ("dynamic_matrix", vec![StaticType::I64, StaticType::I64]),
+            (
+                "array_length",
+                vec![StaticType::Array {
+                    element: Box::new(StaticType::I64),
+                    ndims: Some(5),
+                }],
+            ),
+            (
+                "array_ndims",
+                vec![StaticType::Array {
+                    element: Box::new(StaticType::I64),
+                    ndims: Some(5),
+                }],
+            ),
+            (
+                "array_axis",
+                vec![
+                    StaticType::Array {
+                        element: Box::new(StaticType::I64),
+                        ndims: Some(5),
+                    },
+                    StaticType::I64,
+                ],
+            ),
+            (
+                "array_size",
+                vec![StaticType::Array {
+                    element: Box::new(StaticType::I64),
+                    ndims: Some(5),
+                }],
+            ),
+        ];
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            c_abi_exports: exports
+                .into_iter()
+                .map(|(name, args)| CAbiExport::with_arg_types(name, name, args))
+                .collect(),
+            ..CompileConfig::default()
+        };
+
+        // When: generated Wasm allocates each array and Node decodes ABI v2 directly.
+        let outputs = (0..3)
+            .map(|_| {
+                compile_wasm_source(source, &config)
+                    .expect("primitive array allocation and shape queries should compile")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outputs[0].wasm_bytes, outputs[1].wasm_bytes);
+        assert_eq!(outputs[1].wasm_bytes, outputs[2].wasm_bytes);
+        let dir = tempfile::tempdir().expect("create array validation directory");
+        let wasm_path = dir.path().join("arrays.wasm");
+        fs::write(&wasm_path, &outputs[0].wasm_bytes).expect("write array Wasm");
+        let validation = Command::new("wasm-tools")
+            .arg("validate")
+            .arg(&wasm_path)
+            .output()
+            .expect("validate array Wasm");
+        assert!(
+            validation.status.success(),
+            "{}",
+            String::from_utf8_lossy(&validation.stderr)
+        );
+        let value = run_wasm_bytes_node(
+            &outputs[0].wasm_bytes,
+            r#"
+const e = instance.exports;
+const decode = pointer => {
+  const view = new DataView(e.memory.buffer);
+  const rank = view.getUint32(pointer + 20, true);
+  const dims = Array.from({ length: rank }, (_, axis) => Number(view.getBigUint64(pointer + 40 + axis * 16, true)));
+  const strides = Array.from({ length: rank }, (_, axis) => Number(view.getBigInt64(pointer + 48 + axis * 16, true)));
+  return { flags: view.getUint32(pointer + 4, true), tag: view.getUint32(pointer + 8, true), bytes: view.getUint32(pointer + 12, true), rank, data: view.getUint32(pointer + 24, true), count: Number(view.getBigUint64(pointer + 32, true)), dims, strides };
+};
+const arrays = [e.u8_scalar(), e.f32_empty(), e.f64_matrix(), e.i32_vector(), e.i64_rank5(), e.bool_rank8()];
+const decoded = arrays.map(decode);
+const f32Scalar = e.f32_scalar();
+const f32Descriptor = decode(f32Scalar);
+const f32Bits = new DataView(e.memory.buffer).getUint32(f32Descriptor.data, true).toString(16).padStart(8, "0");
+const rank5 = arrays[4];
+const sizeHandle = e.array_size(rank5);
+let view = new DataView(e.memory.buffer);
+const sizeTuple = Array.from({ length: 5 }, (_, axis) => Number(view.getBigInt64(sizeHandle + 4 + axis * 8, true)));
+const initialBuffer = e.memory.buffer;
+const grown = e.growth_array(5000000n);
+const staleView = initialBuffer.byteLength === 0;
+view = new DataView(e.memory.buffer);
+const grownDecoded = decode(grown);
+const first = new Uint8Array(e.memory.buffer, grownDecoded.data, grownDecoded.count)[0];
+const last = new Uint8Array(e.memory.buffer, grownDecoded.data, grownDecoded.count)[grownDecoded.count - 1];
+const traps = action => { try { action(); return false; } catch (error) { return error instanceof WebAssembly.RuntimeError; } };
+const malformed = [traps(() => e.dynamic_matrix(-1n, 2n)), traps(() => e.dynamic_matrix(2147483648n, 2147483648n)), traps(() => e.array_axis(rank5, 0n)), traps(() => e.growth_array(20000000n))];
+e.__sjulia_drop(grown);
+const dropped = traps(() => e.__sjulia_drop(grown));
+console.log(JSON.stringify({ imports: WebAssembly.Module.imports(module).length, decoded, f32Bits, queries: [Number(e.array_length(rank5)), Number(e.array_ndims(rank5)), Number(e.array_axis(rank5, 4n)), Number(e.array_axis(rank5, 8n))], sizeTuple, growth: [staleView, grownDecoded.count, first, last], malformed, dropped }));
+"#,
+        );
+
+        // Then: tags, widths, canonical column-major strides, emptiness, and queries agree.
+        assert_eq!(
+            value,
+            r#"{"imports":0,"decoded":[{"flags":1,"tag":1,"bytes":1,"rank":0,"data":4208,"count":1,"dims":[],"strides":[]},{"flags":1,"tag":9,"bytes":4,"rank":3,"data":0,"count":0,"dims":[2,0,3],"strides":[1,2,0]},{"flags":1,"tag":10,"bytes":8,"rank":2,"data":4440,"count":6,"dims":[2,3],"strides":[1,2]},{"flags":1,"tag":6,"bytes":4,"rank":1,"data":4624,"count":5,"dims":[5],"strides":[1]},{"flags":1,"tag":8,"bytes":8,"rank":5,"data":4768,"count":6,"dims":[1,2,1,3,1],"strides":[1,1,2,2,6]},{"flags":1,"tag":11,"bytes":1,"rank":8,"data":5000,"count":2,"dims":[1,1,1,1,1,1,1,2],"strides":[1,1,1,1,1,1,1,1]}],"f32Bits":"3f800000","queries":[6,5,3,1],"sizeTuple":[1,2,1,3,1],"growth":[true,5000000,1,1],"malformed":[true,true,true,true],"dropped":true}"#
+        );
+    }
+
+    #[test]
+    fn wasm_backend_emits_a_standalone_module_from_julia_source() {
+        // Given: Julia source lowered through the real parser/lowering pipeline.
+        let source = "add_i64(x::Int64, y::Int64) = x + y\nadd_i64(20, 22)";
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            ..CompileConfig::default()
+        };
+
+        // When: the typed Wasm AoT entry point compiles the lowered program.
+        let output =
+            compile_wasm_source(source, &config).expect("Wasm AoT compilation should succeed");
+
+        // Then: the result is a standalone core WebAssembly module.
+        assert_eq!(&output.wasm_bytes[..4], b"\0asm");
+    }
+
+    #[test]
+    fn wasm_explicit_import_replaces_a_typed_generated_function() {
+        let source = r#"
+host_scale(value::Int64)::Int64 = value
+answer(value::Int64)::Int64 = host_scale(value) + 2
+"#;
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            c_abi_exports: vec![CAbiExport::with_arg_types(
+                "answer",
+                "answer",
+                vec![StaticType::I64],
+            )],
+            wasm_imports: vec![WasmImport {
+                module: "sjulia_host".to_string(),
+                name: "scale".to_string(),
+                function_name: "host_scale".to_string(),
+                params: vec![StaticType::I64],
+                result: Some(StaticType::I64),
+            }],
+            ..CompileConfig::default()
+        };
+        let output =
+            compile_wasm_source(source, &config).expect("typed host import should compile");
+        let stdout = run_wasm_bytes_node_with_imports(
+            &output.wasm_bytes,
+            "{sjulia_host:{scale:value => value * 3n}}",
+            r#"
+const imports = WebAssembly.Module.imports(module);
+console.log(JSON.stringify({imports, answer: instance.exports.answer(10n).toString()}));
+"#,
+        );
+        assert!(stdout.contains(r#""module":"sjulia_host""#));
+        assert!(stdout.contains(r#""name":"scale""#));
+        assert!(stdout.contains(r#""answer":"32""#));
+    }
+
+    #[test]
+    fn wasm_explicit_import_rejects_invalid_contracts() {
+        let source = "host_scale(value::Int64)::Int64 = value";
+        let invalid = [
+            WasmImport {
+                module: "sjulia_host".to_string(),
+                name: "scale".to_string(),
+                function_name: "host_scale".to_string(),
+                params: vec![StaticType::F64],
+                result: Some(StaticType::I64),
+            },
+            WasmImport {
+                module: "sjulia_host".to_string(),
+                name: "missing".to_string(),
+                function_name: "missing".to_string(),
+                params: vec![],
+                result: None,
+            },
+        ];
+        for import in invalid {
+            let error = compile_wasm_source(
+                source,
+                &CompileConfig {
+                    backend: AotBackend::Wasm,
+                    wasm_imports: vec![import],
+                    ..CompileConfig::default()
+                },
+            )
+            .expect_err("invalid host import must fail");
+            assert!(matches!(error, AotError::UnsupportedInstruction(_)));
+        }
+    }
+
+    #[test]
+    fn wasm_returns_static_utf8_literal_through_direct_helper() {
+        // Given: static Julia literals covering UTF-8, embedded NUL, and an empty value.
+        let source = "string_identity(value::String)::String = value\nascii()::String = string_identity(\"hello\")\nempty()::String = \"\"\nnul()::String = \"a\\0b\"\nunicode()::String = \"café 漢字 🐱\"";
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            c_abi_exports: ["ascii", "empty", "nul", "unicode"]
+                .into_iter()
+                .map(|name| CAbiExport::with_arg_types(name, name, Vec::new()))
+                .collect(),
+            ..CompileConfig::default()
+        };
+
+        // When: Node reads each returned static string view as {ptr, byte_len}.
+        let output = compile_wasm_source(source, &config)
+            .expect("static UTF-8 literals should compile for generated Wasm");
+        let value = run_wasm_bytes_node(
+            &output.wasm_bytes,
+            r#"
+const memory = instance.exports.memory;
+const decoder = new TextDecoder("utf-8", { fatal: true });
+const read = name => {
+  const descriptor = instance.exports[name]();
+  const view = new DataView(memory.buffer);
+  const pointer = view.getUint32(descriptor, true);
+  const byteLength = view.getUint32(descriptor + 4, true);
+  const bytes = Array.from(new Uint8Array(memory.buffer, pointer, byteLength));
+  return { text: decoder.decode(Uint8Array.from(bytes)), byteLength, bytes };
+};
+console.log(JSON.stringify([read("ascii"), read("empty"), read("nul"), read("unicode")]));
+"#,
+        );
+
+        // Then: lengths are UTF-8 byte lengths, never character counts or C-string lengths.
+        assert_eq!(
+            value,
+            r#"[{"text":"hello","byteLength":5,"bytes":[104,101,108,108,111]},{"text":"","byteLength":0,"bytes":[]},{"text":"a\u0000b","byteLength":3,"bytes":[97,0,98]},{"text":"café 漢字 🐱","byteLength":17,"bytes":[99,97,102,195,169,32,230,188,162,229,173,151,32,240,159,144,177]}]"#
+        );
+    }
+
+    #[test]
+    fn wasm_interns_static_strings_deterministically_before_heap_allocations() {
+        // Given: duplicate literals and a distinct multibyte literal.
+        let source =
+            "first()::String = \"repeat\"\nsecond()::String = \"repeat\"\nthird()::String = \"𓀀\"";
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            c_abi_exports: ["first", "second", "third"]
+                .into_iter()
+                .map(|name| CAbiExport::with_arg_types(name, name, Vec::new()))
+                .collect(),
+            ..CompileConfig::default()
+        };
+
+        // When: the same source is compiled three times and then grows memory.
+        let outputs = (0..3)
+            .map(|_| {
+                compile_wasm_source(source, &config)
+                    .expect("static literals should compile")
+                    .wasm_bytes
+            })
+            .collect::<Vec<_>>();
+        let value = run_wasm_bytes_node(
+            &outputs[0],
+            r#"
+const { memory, first, second, third, __sjulia_alloc: alloc } = instance.exports;
+const imports = WebAssembly.Module.imports(module).length;
+const firstView = first();
+const secondView = second();
+const thirdView = third();
+const view = new DataView(memory.buffer);
+const firstPtr = view.getUint32(firstView, true);
+const firstLen = view.getUint32(firstView + 4, true);
+const thirdPtr = view.getUint32(thirdView, true);
+const thirdLen = view.getUint32(thirdView + 4, true);
+const firstBytes = Array.from(new Uint8Array(memory.buffer, firstPtr, firstLen));
+const thirdBytes = Array.from(new Uint8Array(memory.buffer, thirdPtr, thirdLen));
+const allocated = alloc(BigInt(memory.buffer.byteLength), 8);
+const survivedGrowth = Array.from(new Uint8Array(memory.buffer, firstPtr, firstLen));
+console.log(JSON.stringify({ imports, interned: firstView === secondView, firstBytes, thirdBytes, allocationAfterData: allocated > thirdPtr + thirdLen, survivedGrowth }));
+"#,
+        );
+
+        // Then: interning and bytes are stable, import-free, and outside allocator storage.
+        assert_eq!(outputs[0], outputs[1]);
+        assert_eq!(outputs[1], outputs[2]);
+        assert_eq!(
+            value,
+            r#"{"imports":0,"interned":true,"firstBytes":[114,101,112,101,97,116],"thirdBytes":[240,147,128,128],"allocationAfterData":true,"survivedGrowth":[114,101,112,101,97,116]}"#
+        );
+    }
+
+    #[test]
+    fn wasm_aggregate_oracle_matches_structural_layout_handles() {
+        // Given: immutable tuples and unrelated isbits structs accepted by Julia.
+        let source = r#"
+struct RGBLike
+    r::Float32
+    g::Float32
+    b::Float32
+end
+struct Unrelated
+    first::Float32
+    second::Float32
+    third::Float32
+end
+struct Mixed
+    count::Int64
+    weight::Float64
+end
+struct Nested
+    color::RGBLike
+    mixed::Mixed
+end
+tuple_helper()::Tuple{Int64,Float64} = (7, 2.5)
+tuple_direct()::Tuple{Int64,Float64} = tuple_helper()
+tuple_field()::Float64 = tuple_direct()[2]
+nested_tuple()::Tuple{Int64,Tuple{Float32,Float64}} = (9, (Float32(1.25), 3.5))
+rgb_value()::RGBLike = RGBLike(Float32(0.25), Float32(0.5), Float32(0.75))
+unrelated_value()::Unrelated = Unrelated(Float32(1), Float32(2), Float32(3))
+mixed_value()::Mixed = Mixed(11, 4.5)
+nested_value()::Nested = Nested(rgb_value(), mixed_value())
+rgb_green(value::RGBLike)::Float32 = value.g
+nested_count(value::Nested)::Int64 = value.mixed.count
+"#;
+        let oracle = Command::new("julia")
+            .args([
+                "--startup-file=no",
+                "-e",
+                &format!(
+                    "{source}\nprintln(tuple_direct()); println(tuple_field()); println(nested_tuple()); println(rgb_green(rgb_value())); println(nested_count(nested_value()))"
+                ),
+            ])
+            .output()
+            .expect("run upstream Julia aggregate oracle");
+        assert!(
+            oracle.status.success(),
+            "{}",
+            String::from_utf8_lossy(&oracle.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&oracle.stdout).trim(),
+            "(7, 2.5)\n2.5\n(9, (1.25f0, 3.5))\n0.5\n11"
+        );
+
+        // When: the same program is compiled repeatedly and Node decodes only
+        // the generated layout table plus each returned handle.
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            c_abi_exports: [
+                "tuple_direct",
+                "tuple_field",
+                "nested_tuple",
+                "rgb_value",
+                "unrelated_value",
+                "mixed_value",
+                "nested_value",
+            ]
+            .into_iter()
+            .map(|name| CAbiExport::with_arg_types(name, name, Vec::new()))
+            .chain([
+                CAbiExport::with_arg_types(
+                    "rgb_green",
+                    "rgb_green",
+                    vec![StaticType::Struct {
+                        type_id: 0,
+                        name: "RGBLike".to_string(),
+                    }],
+                ),
+                CAbiExport::with_arg_types(
+                    "nested_count",
+                    "nested_count",
+                    vec![StaticType::Struct {
+                        type_id: 0,
+                        name: "Nested".to_string(),
+                    }],
+                ),
+            ])
+            .collect(),
+            ..CompileConfig::default()
+        };
+        let outputs = (0..3)
+            .map(|_| compile_wasm_source(source, &config).expect("aggregate Wasm should compile"))
+            .collect::<Vec<_>>();
+        assert_eq!(outputs[0].wasm_bytes, outputs[1].wasm_bytes);
+        assert_eq!(outputs[1].wasm_bytes, outputs[2].wasm_bytes);
+        let value = run_wasm_bytes_node(
+            &outputs[0].wasm_bytes,
+            r#"
+const e = instance.exports;
+const view = () => new DataView(e.memory.buffer);
+const table = e.__sjulia_layout_table();
+const count = e.__sjulia_layout_count();
+const layouts = new Map();
+let cursor = table;
+for (let index = 0; index < count; index += 1) {
+  const data = view();
+  const id = data.getUint32(cursor, true);
+  const size = data.getUint32(cursor + 4, true);
+  const align = data.getUint32(cursor + 8, true);
+  const fields = data.getUint32(cursor + 12, true);
+  const entries = [];
+  for (let field = 0; field < fields; field += 1) {
+    const offset = cursor + 16 + field * 12;
+    entries.push([data.getUint32(offset, true), data.getUint32(offset + 4, true), data.getUint32(offset + 8, true)]);
+  }
+  layouts.set(id, { size, align, fields: entries });
+  cursor += 16 + fields * 12;
+}
+const decode = handle => {
+  const data = view();
+  const id = data.getUint32(handle, true);
+  const layout = layouts.get(id);
+  if (!layout || id === 0) throw new Error("forged aggregate handle");
+  return { id, layout, handle };
+};
+const tuple = decode(e.tuple_direct());
+const nestedTuple = decode(e.nested_tuple());
+const rgb = decode(e.rgb_value());
+const unrelated = decode(e.unrelated_value());
+const mixed = decode(e.mixed_value());
+const nested = decode(e.nested_value());
+const data = view();
+const readF32 = (aggregate, field) => data.getFloat32(aggregate.handle + 4 + aggregate.layout.fields[field][0], true);
+const readI64 = (aggregate, field) => data.getBigInt64(aggregate.handle + 4 + aggregate.layout.fields[field][0], true).toString();
+const tupleValues = [readI64(tuple, 0), data.getFloat64(tuple.handle + 4 + tuple.layout.fields[1][0], true)];
+const traps = action => { try { action(); return false; } catch (error) { return error instanceof WebAssembly.RuntimeError; } };
+console.log(JSON.stringify({
+  imports: WebAssembly.Module.imports(module).length,
+  count,
+  tupleValues,
+  tupleField: e.tuple_field(),
+  rgb: [readF32(rgb, 0), readF32(rgb, 1), readF32(rgb, 2)],
+  green: e.rgb_green(rgb.handle),
+  nestedCount: e.nested_count(nested.handle).toString(),
+  structuralDedup: rgb.id === unrelated.id,
+  distinctMixed: rgb.id !== mixed.id,
+  nestedLayouts: nestedTuple.layout.fields.some(field => field[2] !== 0) && nested.layout.fields.every(field => field[2] !== 0),
+  forged: traps(() => e.rgb_green(mixed.handle)),
+  misaligned: traps(() => e.rgb_green(rgb.handle + 1)),
+}));
+"#,
+        );
+
+        // Then: values, structural IDs, nested field IDs, and forged-handle
+        // rejection are observable without type-name or color-name knowledge.
+        assert_eq!(
+            value,
+            r#"{"imports":0,"count":5,"tupleValues":["7",2.5],"tupleField":2.5,"rgb":[0.25,0.5,0.75],"green":0.5,"nestedCount":"11","structuralDedup":true,"distinctMixed":true,"nestedLayouts":true,"forged":true,"misaligned":true}"#
+        );
+    }
+
+    #[test]
+    fn wasm_rejects_unsupported_aggregate_shapes_and_mutation() {
+        // Given: mutable, reference-bearing, recursive, and mutation cases.
+        let cases = [
+            (
+                "mutable struct MutableValue\nvalue::Int64\nend\nmake()::MutableValue = MutableValue(1)",
+                "make",
+                Vec::new(),
+                "immutable non-parametric isbits struct",
+            ),
+            (
+                "struct NamedValue\nname::String\nend\nmake()::NamedValue = NamedValue(\"x\")",
+                "make",
+                Vec::new(),
+                "is not isbits",
+            ),
+            (
+                "struct ImmutableValue\nvalue::Int64\nend\nfunction mutate(value::ImmutableValue)::Int64\nvalue.value = 2\nreturn value.value\nend",
+                "mutate",
+                vec![StaticType::Struct {
+                    type_id: 0,
+                    name: "ImmutableValue".to_string(),
+                }],
+                "values are immutable",
+            ),
+        ];
+
+        for (source, name, arg_types, expected) in cases {
+            // When: generated-Wasm compilation validates the aggregate graph.
+            let error = compile_wasm_source(
+                source,
+                &CompileConfig {
+                    backend: AotBackend::Wasm,
+                    c_abi_exports: vec![CAbiExport::with_arg_types(name, name, arg_types)],
+                    ..CompileConfig::default()
+                },
+            )
+            .expect_err("unsupported aggregate must not compile");
+
+            // Then: the typed diagnostic identifies the rejected contract.
+            assert!(
+                matches!(error, AotError::UnsupportedInstruction(_)),
+                "{error}"
+            );
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn wasm_rejects_dynamic_string_behavior_with_typed_diagnostics() {
+        // Given: dynamic concatenation, interpolation, and mutation requests.
+        let cases = [
+            (
+                "dynamic(value::String)::String = string(value, \"!\")",
+                "dynamic",
+                vec![StaticType::Str],
+                "dynamic string concatenation or interpolation",
+            ),
+            (
+                "interpolate(value::Int64)::String = \"value = $value\"",
+                "interpolate",
+                vec![StaticType::I64],
+                "dynamic string concatenation or interpolation",
+            ),
+            (
+                "function mutate(value::String)::String\nvalue[1] = 'x'\nreturn value\nend",
+                "mutate",
+                vec![StaticType::Str],
+                "string literals are immutable",
+            ),
+        ];
+
+        for (source, name, arg_types, diagnostic) in cases {
+            // When: generated-Wasm lowering reaches unsupported dynamic behavior.
+            let error = compile_wasm_source(
+                source,
+                &CompileConfig {
+                    backend: AotBackend::Wasm,
+                    c_abi_exports: vec![CAbiExport::with_arg_types(name, name, arg_types)],
+                    ..CompileConfig::default()
+                },
+            )
+            .expect_err("dynamic string behavior must not compile");
+
+            // Then: a typed diagnostic names the unsupported behavior exactly.
+            assert!(matches!(error, AotError::UnsupportedInstruction(_)));
+            assert!(error.to_string().contains(diagnostic), "{error}");
+        }
+    }
+
+    #[test]
+    fn wasm_executes_integer_arithmetic_from_julia_source() {
+        // Given: an independently compiled integer function.
+        let source = "add_scale(x::Int64, y::Int64) = (x + y) * 2";
+
+        // When: Node validates, instantiates, and calls the generated module.
+        let value = compile_and_run_node(
+            source,
+            "add_scale",
+            vec![StaticType::I64, StaticType::I64],
+            "const f = Object.values(instance.exports).find(v => typeof v === 'function' && v.length === 2); console.log(f(10n, 11n).toString());",
+        );
+
+        // Then: Wasm matches Julia's Int64 result.
+        assert_eq!(value, "42");
+    }
+
+    #[test]
+    fn wasm_uint8_subtraction_wraps_before_unsigned_comparison() {
+        // Given: subtraction that wraps from zero to UInt8(255).
+        let source = "function wrapped_sub()::Bool\nx = UInt8(0) - UInt8(1)\nreturn x > 0x64\nend";
+
+        // When: Node executes the exported function.
+        let value = compile_and_run_node(
+            source,
+            "wrapped_sub",
+            Vec::new(),
+            "console.log(Number(instance.exports.wrapped_sub()));",
+        );
+
+        // Then: the wrapped byte compares as unsigned.
+        assert_eq!(value, "1");
+    }
+
+    #[test]
+    fn wasm_uint8_addition_wraps_before_comparison() {
+        // Given: addition that wraps UInt8(250) + UInt8(10) to UInt8(4).
+        let source =
+            "function wrapped_add()::Bool\nx = UInt8(250) + UInt8(10)\nreturn x > UInt8(100)\nend";
+
+        // When: Node executes the exported function.
+        let value = compile_and_run_node(
+            source,
+            "wrapped_add",
+            Vec::new(),
+            "console.log(Number(instance.exports.wrapped_add()));",
+        );
+
+        // Then: comparison observes the normalized byte.
+        assert_eq!(value, "0");
+    }
+
+    #[test]
+    fn wasm_uint8_widens_to_int64_without_sign_extension() {
+        // Given: a wrapped UInt8 value whose high bit is set.
+        let source = "widen_wrapped()::Int64 = Int64(UInt8(0) - UInt8(1))";
+
+        // When: Node executes the exported function.
+        let value = compile_and_run_node(
+            source,
+            "widen_wrapped",
+            Vec::new(),
+            "console.log(instance.exports.widen_wrapped().toString());",
+        );
+
+        // Then: UInt8 widens as 255 rather than -1.
+        assert_eq!(value, "255");
+    }
+
+    #[test]
+    fn wasm_implicit_trailing_value_returns_without_hanging() {
+        // Given: a typed function whose final statement is a ValueCarrier.
+        let source = "function h(x::Int64)::Int64\ny = x * 2\ny\nend";
+
+        // When: the backend reaches the currently unsupported trailing carrier.
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            c_abi_exports: vec![CAbiExport::with_arg_types("h", "h", vec![StaticType::I64])],
+            ..CompileConfig::default()
+        };
+        let error = compile_wasm_source(source, &config)
+            .expect_err("ambiguous trailing carriers must be rejected instead of looping");
+
+        // Then: compilation fails loudly and cannot emit a non-terminating module.
+        assert!(matches!(error, AotError::UnsupportedInstruction(_)));
+        assert!(error.to_string().contains("no unambiguous return value"));
+    }
+
+    #[test]
+    fn wasm_rejects_duplicate_and_reserved_function_identities() {
+        // Given: overloads that collapse to one Wasm symbol and reserved ABI names.
+        let cases = [
+            (
+                "same(x::Int64)::Int64 = x\nsame(x::Float64)::Float64 = x",
+                "same",
+                vec![StaticType::I64],
+            ),
+            ("memory()::Int64 = 1", "memory", Vec::new()),
+            (
+                "__sjulia_wasm_abi_version()::Int64 = 1",
+                "__sjulia_wasm_abi_version",
+                Vec::new(),
+            ),
+        ];
+
+        for (source, name, arg_types) in cases {
+            // When: the canonical Wasm pipeline validates function identities.
+            let error = compile_wasm_source(
+                source,
+                &CompileConfig {
+                    backend: AotBackend::Wasm,
+                    c_abi_exports: vec![CAbiExport::with_arg_types(name, name, arg_types)],
+                    ..CompileConfig::default()
+                },
+            )
+            .expect_err("duplicate or reserved Wasm identities must be rejected");
+
+            // Then: callers receive a typed unsupported diagnostic, not invalid bytes.
+            assert!(
+                matches!(error, AotError::UnsupportedInstruction(_)),
+                "`{name}` produced unexpected diagnostic: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn wasm_honors_requested_export_alias_without_original_export() {
+        // Given: an explicit alias that differs from the Julia function name.
+        let source = "internal_add(x::Int64, y::Int64)::Int64 = x + y";
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            c_abi_exports: vec![CAbiExport::with_arg_types(
+                "public_add",
+                "internal_add",
+                vec![StaticType::I64, StaticType::I64],
+            )],
+            ..CompileConfig::default()
+        };
+
+        // When: the module is compiled and inspected through Node.
+        let output = compile_wasm_source(source, &config).expect("alias should compile");
+        let value = run_wasm_bytes_node(
+            &output.wasm_bytes,
+            "console.log(`${instance.exports.public_add(20n, 22n)}:${Object.hasOwn(instance.exports, 'internal_add')}`);",
+        );
+
+        // Then: only the requested public alias is required.
+        assert_eq!(value, "42:false");
+    }
+
+    #[test]
+    fn wasm_executes_float_comparison_and_conditional_from_julia_source() {
+        // Given: Float64 comparison and conditional control flow.
+        let source = "function choose(x::Float64, y::Float64)::Float64\nif x > y\nreturn x - y\nelse\nreturn y - x\nend\nend";
+
+        // When: the compiled function runs in Node.
+        let value = compile_and_run_node(
+            source,
+            "choose",
+            vec![StaticType::F64, StaticType::F64],
+            "const f = Object.values(instance.exports).find(v => typeof v === 'function' && v.length === 2); console.log(f(1.25, 6.75));",
+        );
+
+        // Then: branch selection and Float64 arithmetic agree with Julia.
+        assert_eq!(value, "5.5");
+    }
+
+    #[test]
+    fn wasm_preserves_float32_constant_return_and_direct_call() {
+        // Given: Float32 constants flowing through a direct helper call.
+        let source = "f32_twice(x::Float32)::Float32 = x + x\nf32_constant()::Float32 = f32_twice(Float32(-0.0))";
+
+        // When: Node observes the exported scalar through its exact f32 bits.
+        let value = compile_and_run_node(
+            source,
+            "f32_constant",
+            Vec::new(),
+            "const bits = new Uint32Array(new Float32Array([instance.exports.f32_constant()]).buffer)[0]; console.log(bits.toString(16).padStart(8, '0'));",
+        );
+
+        // Then: Float32 is neither widened nor stripped of its signed zero.
+        assert_eq!(value, "80000000");
+    }
+
+    #[test]
+    fn wasm_float32_native_operations_match_boundary_matrix() {
+        // Given: Float32 arithmetic, unary negation, ordered comparisons, and overflow.
+        let source = "function f32_ops(x::Float32, y::Float32)::Float32\nif x != x\nreturn x\nelseif x < y\nreturn -(x * y)\nelse\nreturn x / y\nend\nend";
+
+        // When: Node drives finite values, signed zero, infinities, and distinct NaNs.
+        let value = compile_and_run_node(
+            source,
+            "f32_ops",
+            vec![StaticType::F32, StaticType::F32],
+            r#"
+const f = instance.exports.f32_ops;
+const fromBits = bits => new Float32Array(new Uint32Array([bits]).buffer)[0];
+const bits = value => new Uint32Array(new Float32Array([value]).buffer)[0].toString(16).padStart(8, "0");
+const values = [
+  bits(f(2, 0.5)),
+  bits(f(-0, -0)),
+  bits(f(3.4028234663852886e38, 0.5)),
+  bits(f(fromBits(1), 2)),
+  Number.isNaN(f(fromBits(0x7fc00001), 1)),
+  Number.isNaN(f(fromBits(0xffc12345), 1)),
+  f(-Infinity, Infinity) === Infinity,
+];
+console.log(JSON.stringify(values));
+"#,
+        );
+
+        // Then: native Wasm f32 behavior agrees with Julia's Float32 contract.
+        assert_eq!(
+            value,
+            r#"["40800000","7fc00000","7f800000","80000002",true,true,true]"#
+        );
+    }
+
+    #[test]
+    fn wasm_float32_conversions_round_and_reject_inexact_inputs() {
+        // Given: conversions already represented by AoT Convert nodes.
+        let source = "to_f32(x::Float64)::Float32 = Float32(x)\nto_f64(x::Float32)::Float64 = Float64(x)\nto_i32(x::Float32)::Int32 = Int32(x)\nto_i64(x::Float32)::Int64 = Int64(x)\nto_u8(x::Float32)::UInt8 = UInt8(x)\nto_bool(x::Float32)::Bool = Bool(x)\nfrom_i32(x::Int32)::Float32 = Float32(x)\nfrom_i64(x::Int64)::Float32 = Float32(x)\nfrom_u8(x::UInt8)::Float32 = Float32(x)\nfrom_bool(x::Bool)::Float32 = Float32(x)";
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            c_abi_exports: [
+                ("to_f32", vec![StaticType::F64]),
+                ("to_f64", vec![StaticType::F32]),
+                ("to_i32", vec![StaticType::F32]),
+                ("to_i64", vec![StaticType::F32]),
+                ("to_u8", vec![StaticType::F32]),
+                ("to_bool", vec![StaticType::F32]),
+                ("from_i32", vec![StaticType::I32]),
+                ("from_i64", vec![StaticType::I64]),
+                ("from_u8", vec![StaticType::U8]),
+                ("from_bool", vec![StaticType::Bool]),
+            ]
+            .into_iter()
+            .map(|(name, args)| CAbiExport::with_arg_types(name, name, args))
+            .collect(),
+            ..CompileConfig::default()
+        };
+
+        // When: Node probes exact rounding and malformed/inexact conversion inputs.
+        let output = compile_wasm_source(source, &config).expect("F32 conversions should compile");
+        let value = run_wasm_bytes_node(
+            &output.wasm_bytes,
+            r#"
+const e = instance.exports;
+const bits = value => new Uint32Array(new Float32Array([value]).buffer)[0].toString(16).padStart(8, "0");
+const traps = action => { try { action(); return false; } catch (error) { return error instanceof WebAssembly.RuntimeError; } };
+const values = {
+  tie: bits(e.to_f32(1 + 2 ** -24)),
+  aboveTie: bits(e.to_f32(1 + 3 * 2 ** -24)),
+  promoted: e.to_f64(new Float32Array([1.0000001192092896])[0]),
+  i32: e.to_i32(2147483520),
+  i64: e.to_i64(2 ** 62).toString(),
+  u8: e.to_u8(255),
+  bools: [e.to_bool(-0), e.to_bool(1)],
+  fromInts: [bits(e.from_i32(16777217)), bits(e.from_i64(9223372036854775807n)), bits(e.from_u8(255)), bits(e.from_bool(1))],
+  traps: [traps(() => e.to_i32(1.5)), traps(() => e.to_i32(NaN)), traps(() => e.to_i32(Infinity)), traps(() => e.to_i32(2147483648)), traps(() => e.to_i64(2 ** 63)), traps(() => e.to_u8(-1)), traps(() => e.to_u8(256)), traps(() => e.to_bool(2))],
+};
+console.log(JSON.stringify(values));
+"#,
+        );
+
+        // Then: representable values match Julia and every inexact case traps.
+        assert_eq!(
+            value,
+            r#"{"tie":"3f800000","aboveTie":"3f800002","promoted":1.0000001192092896,"i32":2147483520,"i64":"4611686018427387904","u8":255,"bools":[0,1],"fromInts":["4b800000","5f000000","437f0000","3f800000"],"traps":[true,true,true,true,true,true,true,true]}"#
+        );
+    }
+
+    #[test]
+    fn wasm_scalar_math_and_float_predicates_match_julia_boundaries() {
+        // Given: structurally recognized scalar math builtins over both float widths.
+        let source = "f64_abs(x::Float64)::Float64 = abs(x)\nf64_floor(x::Float64)::Float64 = floor(x)\nf64_ceil(x::Float64)::Float64 = ceil(x)\nf64_trunc(x::Float64)::Float64 = trunc(x)\nf64_round(x::Float64)::Float64 = round(x)\nf64_sqrt(x::Float64)::Float64 = sqrt(x)\nf64_min(x::Float64, y::Float64)::Float64 = min(x, y)\nf64_max(x::Float64, y::Float64)::Float64 = max(x, y)\nf64_clamp(x::Float64, lo::Float64, hi::Float64)::Float64 = clamp(x, lo, hi)\nf64_isnan(x::Float64)::Bool = isnan(x)\nf64_isinf(x::Float64)::Bool = isinf(x)\nf64_isfinite(x::Float64)::Bool = isfinite(x)\nf32_abs(x::Float32)::Float32 = abs(x)\nf32_floor(x::Float32)::Float32 = floor(x)\nf32_ceil(x::Float32)::Float32 = ceil(x)\nf32_trunc(x::Float32)::Float32 = trunc(x)\nf32_round(x::Float32)::Float32 = round(x)\nf32_sqrt(x::Float32)::Float32 = sqrt(x)\nf32_min(x::Float32, y::Float32)::Float32 = min(x, y)\nf32_max(x::Float32, y::Float32)::Float32 = max(x, y)\nf32_clamp(x::Float32, lo::Float32, hi::Float32)::Float32 = clamp(x, lo, hi)\nf32_isnan(x::Float32)::Bool = isnan(x)\nf32_isinf(x::Float32)::Bool = isinf(x)\nf32_isfinite(x::Float32)::Bool = isfinite(x)";
+        let mut exports = Vec::new();
+        for name in [
+            "abs", "floor", "ceil", "trunc", "round", "sqrt", "isnan", "isinf", "isfinite",
+        ] {
+            exports.push(CAbiExport::with_arg_types(
+                format!("f64_{name}"),
+                format!("f64_{name}"),
+                vec![StaticType::F64],
+            ));
+            exports.push(CAbiExport::with_arg_types(
+                format!("f32_{name}"),
+                format!("f32_{name}"),
+                vec![StaticType::F32],
+            ));
+        }
+        for name in ["min", "max"] {
+            exports.push(CAbiExport::with_arg_types(
+                format!("f64_{name}"),
+                format!("f64_{name}"),
+                vec![StaticType::F64, StaticType::F64],
+            ));
+            exports.push(CAbiExport::with_arg_types(
+                format!("f32_{name}"),
+                format!("f32_{name}"),
+                vec![StaticType::F32, StaticType::F32],
+            ));
+        }
+        exports.push(CAbiExport::with_arg_types(
+            "f64_clamp",
+            "f64_clamp",
+            vec![StaticType::F64; 3],
+        ));
+        exports.push(CAbiExport::with_arg_types(
+            "f32_clamp",
+            "f32_clamp",
+            vec![StaticType::F32; 3],
+        ));
+
+        // When: Node executes Julia-oracle edge cases and reports exact IEEE bits.
+        let output = compile_wasm_source(
+            source,
+            &CompileConfig {
+                backend: AotBackend::Wasm,
+                c_abi_exports: exports,
+                ..CompileConfig::default()
+            },
+        )
+        .expect("scalar math builtins should compile");
+        let value = run_wasm_bytes_node(
+            &output.wasm_bytes,
+            r#"
+const e = instance.exports;
+const b64 = x => new BigUint64Array(new Float64Array([x]).buffer)[0].toString(16).padStart(16, "0");
+const b32 = x => new Uint32Array(new Float32Array([x]).buffer)[0].toString(16).padStart(8, "0");
+const sub64 = Number.MIN_VALUE;
+const sub32 = new Float32Array(new Uint32Array([1]).buffer)[0];
+const values = {
+  f64: [b64(e.f64_abs(-0)), b64(e.f64_floor(-0)), b64(e.f64_ceil(sub64)), b64(e.f64_trunc(-2.75)), b64(e.f64_round(2.5)), b64(e.f64_round(3.5)), b64(e.f64_sqrt(-0)), b64(e.f64_sqrt(sub64)), b64(e.f64_min(-0, 0)), b64(e.f64_max(0, -0)), Number.isNaN(e.f64_min(NaN, 1)), Number.isNaN(e.f64_max(1, NaN)), b64(e.f64_clamp(-0, 0, 1)), e.f64_isnan(NaN), e.f64_isinf(Infinity), e.f64_isfinite(Number.MAX_VALUE)],
+  f32: [b32(e.f32_abs(-0)), b32(e.f32_floor(-0)), b32(e.f32_ceil(sub32)), b32(e.f32_trunc(-2.75)), b32(e.f32_round(2.5)), b32(e.f32_round(3.5)), b32(e.f32_sqrt(-0)), b32(e.f32_sqrt(sub32)), b32(e.f32_min(-0, 0)), b32(e.f32_max(0, -0)), Number.isNaN(e.f32_min(NaN, 1)), Number.isNaN(e.f32_max(1, NaN)), b32(e.f32_clamp(-0, 0, 1)), e.f32_isnan(NaN), e.f32_isinf(Infinity), e.f32_isfinite(3.4028234663852886e38)],
+};
+console.log(JSON.stringify(values));
+"#,
+        );
+
+        // Then: native Wasm instructions match Julia 1.12.4, including ties-to-even and signed zero.
+        assert_eq!(
+            value,
+            r#"{"f64":["0000000000000000","8000000000000000","3ff0000000000000","c000000000000000","4000000000000000","4010000000000000","8000000000000000","1e60000000000000","8000000000000000","0000000000000000",true,true,"8000000000000000",1,1,1],"f32":["00000000","80000000","3f800000","c0000000","40000000","40800000","80000000","1a3504f3","80000000","00000000",true,true,"80000000",1,1,1]}"#
+        );
+    }
+
+    #[test]
+    fn wasm_import_free_pow_matches_julia_scalar_matrix() {
+        // Given: direct and composed powers for both floating widths.
+        let source = "f64_pow(x::Float64, y::Float64)::Float64 = x ^ y\nf64_gamma(x::Float64)::Float64 = clamp(x, 0.0, 1.0) ^ 2.2\nf32_pow(x::Float32, y::Float32)::Float32 = x ^ y";
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            c_abi_exports: vec![
+                CAbiExport::with_arg_types("f64_pow", "f64_pow", vec![StaticType::F64; 2]),
+                CAbiExport::with_arg_types("f64_gamma", "f64_gamma", vec![StaticType::F64]),
+                CAbiExport::with_arg_types("f32_pow", "f32_pow", vec![StaticType::F32; 2]),
+            ],
+            ..CompileConfig::default()
+        };
+
+        // When: the generated module is inspected and executed over representative domains.
+        let output = compile_wasm_source(source, &config).expect("pow should compile");
+        let value = run_wasm_bytes_node(
+            &output.wasm_bytes,
+            r#"
+const e = instance.exports;
+const close = (actual, expected, tolerance) => Math.abs(actual - expected) <= tolerance * Math.max(1, Math.abs(expected));
+const traps = action => { try { action(); return false; } catch (error) { return error instanceof WebAssembly.RuntimeError; } };
+console.log(JSON.stringify({
+  imports: WebAssembly.Module.imports(module).length,
+  f64: [close(e.f64_pow(2, 10), 1024, 1e-12), close(e.f64_pow(9, 0.5), 3, 1e-12), close(e.f64_pow(2, -3), 0.125, 1e-12), close(e.f64_pow(-2, 3), -8, 1e-12), close(e.f64_gamma(0.5), 0.217637640824031, 1e-12), e.f64_pow(0, 0) === 1, traps(() => e.f64_pow(-2, 0.5))],
+  f32: [close(e.f32_pow(2, 10), 1024, 1e-5), close(e.f32_pow(9, 0.5), 3, 1e-5), close(e.f32_pow(2, -3), 0.125, 1e-5), close(e.f32_pow(-2, 3), -8, 1e-5), traps(() => e.f32_pow(-2, 0.5))],
+}));
+"#,
+        );
+
+        // Then: helpers remain import-free and values satisfy the explicit tolerance manifest.
+        assert_eq!(
+            value,
+            r#"{"imports":0,"f64":[true,true,true,true,true,true,true],"f32":[true,true,true,true,true]}"#
+        );
+    }
+
+    #[test]
+    fn wasm_pow_special_values_match_julia() {
+        // Given: Julia 1.12.4 power identities over zero, infinities, and NaN.
+        let source = "f64_pow_edge(x::Float64, y::Float64)::Float64 = x ^ y\nf32_pow_edge(x::Float32, y::Float32)::Float32 = x ^ y\nf64_pow_repeat(x::Float64)::Float64 = (x ^ 0.5) + (x ^ 2.0) + (x ^ -1.0)";
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            c_abi_exports: vec![
+                CAbiExport::with_arg_types(
+                    "f64_pow_edge",
+                    "f64_pow_edge",
+                    vec![StaticType::F64; 2],
+                ),
+                CAbiExport::with_arg_types(
+                    "f32_pow_edge",
+                    "f32_pow_edge",
+                    vec![StaticType::F32; 2],
+                ),
+                CAbiExport::with_arg_types(
+                    "f64_pow_repeat",
+                    "f64_pow_repeat",
+                    vec![StaticType::F64],
+                ),
+            ],
+            ..CompileConfig::default()
+        };
+
+        // When: Node records exact result bits and typed domain traps.
+        let output = compile_wasm_source(source, &config).expect("pow edges should compile");
+        let value = run_wasm_bytes_node(
+            &output.wasm_bytes,
+            r#"
+const e = instance.exports;
+const b64 = x => new BigUint64Array(new Float64Array([x]).buffer)[0].toString(16).padStart(16, "0");
+const b32 = x => new Uint32Array(new Float32Array([x]).buffer)[0].toString(16).padStart(8, "0");
+const traps = action => { try { action(); return false; } catch (error) { return error instanceof WebAssembly.RuntimeError; } };
+console.log(JSON.stringify({
+  imports: WebAssembly.Module.imports(module).length,
+  f64: [[0,3],[0,0.5],[0,-3],[0,0],[-0,3],[-0,2],[-0,-3],[-0,-2],[Infinity,3],[Infinity,-3],[-Infinity,3],[-Infinity,2],[-Infinity,-3],[-Infinity,-2],[NaN,3],[NaN,0]].map(([x,y]) => b64(e.f64_pow_edge(x,y))),
+  f32: [[0,0.5],[0,-3],[-0,3],[-0,-3],[Infinity,-2],[-Infinity,3],[NaN,2],[NaN,0]].map(([x,y]) => b32(e.f32_pow_edge(x,y))),
+  traps: [traps(() => e.f64_pow_edge(-2,0.5)), traps(() => e.f64_pow_edge(-Infinity,0.5)), traps(() => e.f32_pow_edge(-Infinity,0.5))],
+  repeat: Math.abs(e.f64_pow_repeat(4) - 18.25) <= 1e-12,
+}));
+"#,
+        );
+
+        // Then: identities preserve Julia signed-zero/infinity bits and scratch isolation.
+        assert_eq!(
+            value,
+            r#"{"imports":0,"f64":["0000000000000000","0000000000000000","7ff0000000000000","3ff0000000000000","8000000000000000","0000000000000000","fff0000000000000","7ff0000000000000","7ff0000000000000","0000000000000000","fff0000000000000","7ff0000000000000","0000000000000000","0000000000000000","7ff8000000000000","3ff0000000000000"],"f32":["00000000","7f800000","80000000","ff800000","00000000","ff800000","7fc00000","3f800000"],"traps":[true,true,true],"repeat":true}"#
+        );
+    }
+
+    #[test]
+    fn wasm_pow_infinite_exponents_and_extremes_match_julia() {
+        // Given: Julia 1.12.4 identities for NaN, infinite exponents, and extreme finite bases.
+        let source = "f64_pow_final(x::Float64, y::Float64)::Float64 = x ^ y\nf32_pow_final(x::Float32, y::Float32)::Float32 = x ^ y\nf64_pow_nested(x::Float64)::Float64 = ((x ^ 2.0) ^ -1.0) + (x ^ 3.0)";
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            c_abi_exports: vec![
+                CAbiExport::with_arg_types(
+                    "f64_pow_final",
+                    "f64_pow_final",
+                    vec![StaticType::F64; 2],
+                ),
+                CAbiExport::with_arg_types(
+                    "f32_pow_final",
+                    "f32_pow_final",
+                    vec![StaticType::F32; 2],
+                ),
+                CAbiExport::with_arg_types(
+                    "f64_pow_nested",
+                    "f64_pow_nested",
+                    vec![StaticType::F64],
+                ),
+            ],
+            ..CompileConfig::default()
+        };
+
+        // When: Node records exact classifications and repeated-call scratch behavior.
+        let output = compile_wasm_source(source, &config).expect("final pow edges should compile");
+        let value = run_wasm_bytes_node(
+            &output.wasm_bytes,
+            r#"
+const e = instance.exports;
+const b64 = x => new BigUint64Array(new Float64Array([x]).buffer)[0].toString(16).padStart(16, "0");
+const b32 = x => new Uint32Array(new Float32Array([x]).buffer)[0].toString(16).padStart(8, "0");
+console.log(JSON.stringify({
+  imports: WebAssembly.Module.imports(module).length,
+  f64: [[1,NaN],[NaN,0],[NaN,2],[2,Infinity],[2,-Infinity],[0.5,Infinity],[0.5,-Infinity],[1,Infinity],[1,-Infinity],[-2,Infinity],[-2,-Infinity],[-0.5,Infinity],[-0.5,-Infinity],[Number.MIN_VALUE,2],[Number.MIN_VALUE,-2],[Number.MAX_VALUE,2],[Number.MAX_VALUE,-2]].map(([x,y]) => b64(e.f64_pow_final(x,y))),
+  f32: [[1,NaN],[NaN,0],[2,Infinity],[2,-Infinity],[0.5,Infinity],[0.5,-Infinity],[-2,Infinity],[-0.5,-Infinity],[1.401298464324817e-45,2],[3.4028234663852886e38,2]].map(([x,y]) => b32(e.f32_pow_final(x,y))),
+  nested: Math.abs(e.f64_pow_nested(2) - 8.25) <= 1e-12,
+}));
+"#,
+        );
+
+        // Then: exponent classification and bounded exp preserve Julia results without imports.
+        assert_eq!(
+            value,
+            r#"{"imports":0,"f64":["3ff0000000000000","3ff0000000000000","7ff8000000000000","7ff0000000000000","0000000000000000","0000000000000000","7ff0000000000000","3ff0000000000000","3ff0000000000000","7ff0000000000000","0000000000000000","0000000000000000","7ff0000000000000","0000000000000000","7ff0000000000000","7ff0000000000000","0000000000000000"],"f32":["3f800000","3f800000","7f800000","00000000","00000000","7f800000","7f800000","7f800000","00000000","7f800000"],"nested":true}"#
+        );
+    }
+
+    #[test]
+    fn wasm_negative_one_infinite_power_matches_julia() {
+        // Given: Julia 1.12.4's unit-magnitude precedence over infinite exponents.
+        let source = "f64_neg_one_pow(y::Float64)::Float64 = (-1.0) ^ y\nf32_neg_one_pow(y::Float32)::Float32 = Float32(-1.0) ^ y\nf64_one_pow(y::Float64)::Float64 = 1.0 ^ y\nf64_nan_pow(y::Float64)::Float64 = NaN ^ y";
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            c_abi_exports: vec![
+                CAbiExport::with_arg_types(
+                    "f64_neg_one_pow",
+                    "f64_neg_one_pow",
+                    vec![StaticType::F64],
+                ),
+                CAbiExport::with_arg_types(
+                    "f32_neg_one_pow",
+                    "f32_neg_one_pow",
+                    vec![StaticType::F32],
+                ),
+                CAbiExport::with_arg_types("f64_one_pow", "f64_one_pow", vec![StaticType::F64]),
+                CAbiExport::with_arg_types("f64_nan_pow", "f64_nan_pow", vec![StaticType::F64]),
+            ],
+            ..CompileConfig::default()
+        };
+
+        // When: Node records exact special and finite parity bits.
+        let output =
+            compile_wasm_source(source, &config).expect("negative-one powers should compile");
+        let value = run_wasm_bytes_node(
+            &output.wasm_bytes,
+            r#"
+const e = instance.exports;
+const b64 = x => new BigUint64Array(new Float64Array([x]).buffer)[0].toString(16).padStart(16, "0");
+const b32 = x => new Uint32Array(new Float32Array([x]).buffer)[0].toString(16).padStart(8, "0");
+console.log(JSON.stringify({
+  imports: WebAssembly.Module.imports(module).length,
+  neg64: [Infinity,-Infinity,NaN,0,3,2].map(x => b64(e.f64_neg_one_pow(x))),
+  neg32: [Infinity,-Infinity,NaN,0,3,2].map(x => b32(e.f32_neg_one_pow(x))),
+  precedence: [b64(e.f64_one_pow(NaN)),b64(e.f64_nan_pow(0)),b64(e.f64_nan_pow(2))],
+}));
+"#,
+        );
+
+        // Then: only ±infinite exponents use abs(base)==1; NaN and finite rules remain intact.
+        assert_eq!(
+            value,
+            r#"{"imports":0,"neg64":["3ff0000000000000","3ff0000000000000","7ff8000000000000","3ff0000000000000","bff0000000000000","3ff0000000000000"],"neg32":["3f800000","3f800000","7fc00000","3f800000","bf800000","3f800000"],"precedence":["3ff0000000000000","3ff0000000000000","7ff8000000000000"]}"#
+        );
+    }
+
+    #[test]
+    fn wasm_import_free_exp_log_match_julia_scalar_matrix() {
+        // Given: direct and composed exp/log functions for both floating widths.
+        let source = "f64_exp(x::Float64)::Float64 = exp(x)\nf64_log(x::Float64)::Float64 = log(x)\nf64_roundtrip(x::Float64)::Float64 = exp(log(x))\nf32_exp(x::Float32)::Float32 = exp(x)\nf32_log(x::Float32)::Float32 = log(x)";
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            c_abi_exports: vec![
+                CAbiExport::with_arg_types("f64_exp", "f64_exp", vec![StaticType::F64]),
+                CAbiExport::with_arg_types("f64_log", "f64_log", vec![StaticType::F64]),
+                CAbiExport::with_arg_types("f64_roundtrip", "f64_roundtrip", vec![StaticType::F64]),
+                CAbiExport::with_arg_types("f32_exp", "f32_exp", vec![StaticType::F32]),
+                CAbiExport::with_arg_types("f32_log", "f32_log", vec![StaticType::F32]),
+            ],
+            ..CompileConfig::default()
+        };
+
+        // When: Node executes representative values, boundaries, and invalid domains.
+        let output = compile_wasm_source(source, &config).expect("exp/log should compile");
+        let value = run_wasm_bytes_node(
+            &output.wasm_bytes,
+            r#"
+const e = instance.exports;
+const close = (actual, expected, tolerance) => Math.abs(actual - expected) <= tolerance * Math.max(1, Math.abs(expected));
+const traps = action => { try { action(); return false; } catch (error) { return error instanceof WebAssembly.RuntimeError; } };
+console.log(JSON.stringify({
+  imports: WebAssembly.Module.imports(module).length,
+  f64: [close(e.f64_exp(-20), Math.exp(-20), 1e-12), close(e.f64_exp(0), 1, 1e-12), close(e.f64_exp(20), Math.exp(20), 1e-12), close(e.f64_log(Number.MIN_VALUE), Math.log(Number.MIN_VALUE), 1e-12), close(e.f64_log(1), 0, 1e-12), close(e.f64_log(Number.MAX_VALUE), Math.log(Number.MAX_VALUE), 1e-12), close(e.f64_roundtrip(0.125), 0.125, 1e-12), traps(() => e.f64_log(-1))],
+  f32: [close(e.f32_exp(-10), Math.exp(-10), 1e-5), close(e.f32_exp(10), Math.exp(10), 1e-5), close(e.f32_log(0.125), Math.log(0.125), 1e-5), close(e.f32_log(3.4028234663852886e38), Math.log(3.4028234663852886e38), 1e-5), traps(() => e.f32_log(-1))],
+}));
+"#,
+        );
+
+        // Then: generated approximations remain import-free within manifest tolerances.
+        assert_eq!(
+            value,
+            r#"{"imports":0,"f64":[true,true,true,true,true,true,true,true],"f32":[true,true,true,true,true]}"#
+        );
+    }
+
+    #[test]
+    fn wasm_exp_log_special_values_and_thresholds_match_julia() {
+        // Given: Julia 1.12.4 special values and dense finite threshold probes.
+        let source = "f64_exp_edge(x::Float64)::Float64 = exp(x)\nf64_log_edge(x::Float64)::Float64 = log(x)\nf32_exp_edge(x::Float32)::Float32 = exp(x)\nf32_log_edge(x::Float32)::Float32 = log(x)\nf64_exp_log_repeat(x::Float64)::Float64 = exp(log(x)) + log(exp(x))";
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            c_abi_exports: vec![
+                CAbiExport::with_arg_types("f64_exp_edge", "f64_exp_edge", vec![StaticType::F64]),
+                CAbiExport::with_arg_types("f64_log_edge", "f64_log_edge", vec![StaticType::F64]),
+                CAbiExport::with_arg_types("f32_exp_edge", "f32_exp_edge", vec![StaticType::F32]),
+                CAbiExport::with_arg_types("f32_log_edge", "f32_log_edge", vec![StaticType::F32]),
+                CAbiExport::with_arg_types(
+                    "f64_exp_log_repeat",
+                    "f64_exp_log_repeat",
+                    vec![StaticType::F64],
+                ),
+            ],
+            ..CompileConfig::default()
+        };
+
+        // When: Node compares exact special bits and finite results to Julia oracles.
+        let output = compile_wasm_source(source, &config).expect("exp/log edges should compile");
+        let value = run_wasm_bytes_node(
+            &output.wasm_bytes,
+            r#"
+const e = instance.exports;
+const b64 = x => new BigUint64Array(new Float64Array([x]).buffer)[0].toString(16).padStart(16, "0");
+const b32 = x => new Uint32Array(new Float32Array([x]).buffer)[0].toString(16).padStart(8, "0");
+const close = (a,b,t) => Math.abs(a-b) <= t * Math.max(1,Math.abs(b));
+const traps = action => { try { action(); return false; } catch (error) { return error instanceof WebAssembly.RuntimeError; } };
+const exp64 = [[709,8.218407461554972e307],[709.5,1.3549863193146328e308],[-744,1e-323],[-745,5e-324]];
+const log64 = [[Number.MIN_VALUE,-744.4400719213812],[Number.MAX_VALUE,709.782712893384]];
+console.log(JSON.stringify({
+  imports: WebAssembly.Module.imports(module).length,
+  exp64Special: [Infinity,-Infinity,NaN,750,-750].map(x => b64(e.f64_exp_edge(x))),
+  exp32Special: [Infinity,-Infinity,NaN,100,-110].map(x => b32(e.f32_exp_edge(x))),
+  log64Special: [0,-0,Infinity,NaN].map(x => b64(e.f64_log_edge(x))),
+  log32Special: [0,-0,Infinity,NaN].map(x => b32(e.f32_log_edge(x))),
+  finite64: exp64.map(([x,y]) => close(e.f64_exp_edge(x),y,1e-12)).concat(log64.map(([x,y]) => close(e.f64_log_edge(x),y,1e-12))),
+  finite32: [close(e.f32_exp_edge(80),5.5406225e34,1e-5),close(e.f32_exp_edge(-100),3.8e-44,1e-5),close(e.f32_log_edge(1.401298464324817e-45),-103.27893,1e-5)],
+  traps: [traps(() => e.f64_log_edge(-1)),traps(() => e.f32_log_edge(-1))],
+  repeat: close(e.f64_exp_log_repeat(4),8,1e-12),
+}));
+"#,
+        );
+
+        // Then: classification precedes approximation and exponent construction never wraps.
+        assert_eq!(
+            value,
+            r#"{"imports":0,"exp64Special":["7ff0000000000000","0000000000000000","7ff8000000000000","7ff0000000000000","0000000000000000"],"exp32Special":["7f800000","00000000","7fc00000","7f800000","00000000"],"log64Special":["fff0000000000000","fff0000000000000","7ff0000000000000","7ff8000000000000"],"log32Special":["ff800000","ff800000","7f800000","7fc00000"],"finite64":[true,true,true,true,true,true],"finite32":[true,true,true],"traps":[true,true],"repeat":true}"#
+        );
+    }
+
+    #[test]
+    fn wasm_executes_counted_loop_from_julia_source() {
+        // Given: a counted while loop with mutable scalar locals.
+        let source = "function triangular(n::Int64)::Int64\ni = 1\ns = 0\nwhile i <= n\ns = s + i\ni = i + 1\nend\nreturn s\nend";
+
+        // When: the loop executes in generated Wasm.
+        let value = compile_and_run_node(
+            source,
+            "triangular",
+            vec![StaticType::I64],
+            "const f = Object.values(instance.exports).find(v => typeof v === 'function' && v.length === 1 && v !== instance.exports.__sjulia_wasm_abi_version); console.log(f(9n).toString());",
+        );
+
+        // Then: repeated block dispatch produces the expected sum.
+        assert_eq!(value, "45");
+    }
+
+    #[test]
+    fn wasm_executes_direct_helper_call_from_julia_source() {
+        // Given: two typed Julia functions with a direct call edge.
+        let source = "twice(x::Int64) = x * 2\nplus_twice(x::Int64, y::Int64) = x + twice(y)";
+
+        // When: the caller is executed from Node.
+        let value = compile_and_run_node(
+            source,
+            "plus_twice",
+            vec![StaticType::I64, StaticType::I64],
+            "const f = Object.entries(instance.exports).find(([name, v]) => name.includes('plus_twice') && typeof v === 'function')[1]; console.log(f(4n, 19n).toString());",
+        );
+
+        // Then: direct Wasm call resolution preserves the helper result.
+        assert_eq!(value, "42");
+    }
+
+    #[test]
+    fn wasm_mutates_uint8_memory_through_versioned_descriptor() {
+        // Given: a generic UInt8 mutation loop using Julia's one-based indexing.
+        let source = "function increment!(bytes::Vector{UInt8})\ni = 1\nwhile i <= length(bytes)\nbytes[i] = UInt8(bytes[i] + 1)\ni = i + 1\nend\nreturn length(bytes)\nend";
+
+        // When: the host writes a v2 descriptor and invokes generated Wasm.
+        let value = compile_and_run_node(
+            source,
+            "increment!",
+            vec![StaticType::Array { element: Box::new(StaticType::U8), ndims: Some(1) }],
+            "const memory = instance.exports.memory; const view = new DataView(memory.buffer); const descriptor = 32; const ptr = 128; const input = new Uint8Array(memory.buffer, ptr, 4); input.set([1, 2, 254, 0]); view.setUint32(descriptor, 2, true); view.setUint32(descriptor + 4, 0, true); view.setUint32(descriptor + 8, 1, true); view.setUint32(descriptor + 12, 1, true); view.setUint32(descriptor + 16, 0, true); view.setUint32(descriptor + 20, 1, true); view.setUint32(descriptor + 24, ptr, true); view.setUint32(descriptor + 28, 0, true); view.setBigUint64(descriptor + 32, 4n, true); view.setBigUint64(descriptor + 40, 4n, true); view.setBigInt64(descriptor + 48, 1n, true); const f = Object.entries(instance.exports).find(([name, v]) => name.includes('increment') && typeof v === 'function')[1]; const len = f(descriptor); console.log(`${len}:${Array.from(input).join(',')}:${instance.exports.__sjulia_wasm_abi_version()}`);",
+        );
+
+        // Then: bytes mutate in place and ABI metadata remains observable.
+        assert_eq!(value, "4:2,3,255,1:2");
+    }
+
+    #[test]
+    fn wasm_rgba_loop_preserves_alpha() {
+        // Given: an RGBA loop expressed only through generic UInt8 indexing.
+        let source = "function invert_rgba!(bytes::Vector{UInt8})\ni = 1\nwhile i <= length(bytes)\nbytes[i] = UInt8(255 - bytes[i])\nbytes[i + 1] = UInt8(255 - bytes[i + 1])\nbytes[i + 2] = UInt8(255 - bytes[i + 2])\ni = i + 4\nend\nreturn length(bytes)\nend";
+
+        // When: generated Wasm mutates host-owned linear memory.
+        let value = compile_and_run_node(
+            source,
+            "invert_rgba!",
+            vec![StaticType::Array { element: Box::new(StaticType::U8), ndims: Some(1) }],
+            "const memory = instance.exports.memory; const view = new DataView(memory.buffer); const descriptor = 32; const ptr = 128; const input = new Uint8Array(memory.buffer, ptr, 8); input.set([10, 20, 30, 40, 100, 150, 200, 250]); view.setUint32(descriptor, 2, true); view.setUint32(descriptor + 4, 0, true); view.setUint32(descriptor + 8, 1, true); view.setUint32(descriptor + 12, 1, true); view.setUint32(descriptor + 16, 0, true); view.setUint32(descriptor + 20, 1, true); view.setUint32(descriptor + 24, ptr, true); view.setUint32(descriptor + 28, 0, true); view.setBigUint64(descriptor + 32, 8n, true); view.setBigUint64(descriptor + 40, 8n, true); view.setBigInt64(descriptor + 48, 1n, true); const f = Object.entries(instance.exports).find(([name, v]) => name.includes('invert_rgba') && typeof v === 'function')[1]; f(descriptor); console.log(Array.from(input).join(','));",
+        );
+
+        // Then: RGB channels invert while both alpha bytes stay unchanged.
+        assert_eq!(value, "245,235,225,40,155,105,55,250");
+    }
+
+    #[test]
+    fn wasm_phi_edge_copies_are_parallel() {
+        // Given: a low-level edge with cyclic phi assignments a <- b and b <- a.
+        let mut function = IrFunction::new("phi_swap".to_string(), Vec::new(), StaticType::I64);
+        let a = VarRef::new("a".to_string(), StaticType::I64);
+        let b = VarRef::new("b".to_string(), StaticType::I64);
+        let ten = VarRef::new("ten".to_string(), StaticType::I64);
+        let scaled = VarRef::new("scaled".to_string(), StaticType::I64);
+        let result = VarRef::new("result".to_string(), StaticType::I64);
+        let entry = function
+            .entry_block_mut()
+            .expect("IR function has entry block");
+        entry.push(Instruction::LoadConst {
+            dest: a.clone(),
+            value: ConstValue::Int64(1),
+        });
+        entry.push(Instruction::LoadConst {
+            dest: b.clone(),
+            value: ConstValue::Int64(2),
+        });
+        entry.set_terminator(Terminator::Jump("join".to_string()));
+        let mut join = BasicBlock::new("join".to_string());
+        join.push(Instruction::Phi {
+            dest: a.clone(),
+            incoming: vec![("entry".to_string(), b.clone())],
+        });
+        join.push(Instruction::Phi {
+            dest: b.clone(),
+            incoming: vec![("entry".to_string(), a.clone())],
+        });
+        join.push(Instruction::LoadConst {
+            dest: ten.clone(),
+            value: ConstValue::Int64(10),
+        });
+        join.push(Instruction::BinOp {
+            dest: scaled.clone(),
+            op: BinOpKind::Mul,
+            left: a.clone(),
+            right: ten,
+        });
+        join.push(Instruction::BinOp {
+            dest: result.clone(),
+            op: BinOpKind::Add,
+            left: scaled,
+            right: b,
+        });
+        join.set_terminator(Terminator::Return(Some(result)));
+        function.add_block(join);
+        let mut module = IrModule::new("phi_swap".to_string());
+        module.add_function(function);
+
+        // When: the backend emits and Node executes the cyclic phi edge.
+        let bytes = emit_module(&module, &[], &[]).expect("phi module should emit");
+        let value = run_wasm_bytes_node(
+            &bytes,
+            "console.log(instance.exports.phi_swap().toString());",
+        );
+
+        // Then: both reads observe predecessor values before either destination changes.
+        assert_eq!(value, "21");
+    }
+
+    #[test]
+    fn wasm_uint8_descriptor_rejects_malformed_host_ranges() {
+        // Given: a real Julia UInt8 reader and four malformed v2 host descriptors.
+        let source = "first_byte(bytes::Vector{UInt8}) = bytes[1]";
+        let javascript = "const memory = instance.exports.memory; const view = new DataView(memory.buffer); const f = Object.entries(instance.exports).find(([name, v]) => name.includes('first_byte') && typeof v === 'function')[1]; const descriptor = 32; const ptr = 128; function valid() { view.setUint32(descriptor, 2, true); view.setUint32(descriptor + 4, 0, true); view.setUint32(descriptor + 8, 1, true); view.setUint32(descriptor + 12, 1, true); view.setUint32(descriptor + 16, 0, true); view.setUint32(descriptor + 20, 1, true); view.setUint32(descriptor + 24, ptr, true); view.setUint32(descriptor + 28, 0, true); view.setBigUint64(descriptor + 32, 1n, true); view.setBigUint64(descriptor + 40, 1n, true); view.setBigInt64(descriptor + 48, 1n, true); } const cases = [() => view.setUint32(descriptor, 1, true), () => view.setBigUint64(descriptor + 32, 2n, true), () => view.setUint32(descriptor + 24, memory.buffer.byteLength, true), () => view.setBigInt64(descriptor + 48, -1n, true)]; let traps = 0; for (const corrupt of cases) { valid(); corrupt(); try { f(descriptor); } catch (error) { if (error instanceof WebAssembly.RuntimeError) traps += 1; } } console.log(traps);";
+
+        // When: Node calls generated Wasm with each malformed descriptor.
+        let value = compile_and_run_node(
+            source,
+            "first_byte",
+            vec![StaticType::Array {
+                element: Box::new(StaticType::U8),
+                ndims: Some(1),
+            }],
+            javascript,
+        );
+
+        // Then: every malformed descriptor traps before a memory access succeeds.
+        assert_eq!(value, "4");
+    }
+
+    #[test]
+    fn wasm_descriptor_v2_rejects_header_contract_violations_before_store() {
+        // Given: a rank-1 writer and malformed fixed-header or expected-type fields.
+        let source = "function set_first!(bytes::Vector{UInt8})::Int64\nbytes[1] = UInt8(99)\nreturn length(bytes)\nend";
+        let javascript = r#"
+const memory = instance.exports.memory;
+const view = new DataView(memory.buffer);
+const descriptor = 32;
+const pointer = 128;
+const input = new Uint8Array(memory.buffer, pointer, 1);
+const target = instance.exports["set_first!"];
+function valid() {
+  view.setUint32(descriptor, 2, true);
+  view.setUint32(descriptor + 4, 0, true);
+  view.setUint32(descriptor + 8, 1, true);
+  view.setUint32(descriptor + 12, 1, true);
+  view.setUint32(descriptor + 16, 0, true);
+  view.setUint32(descriptor + 20, 1, true);
+  view.setUint32(descriptor + 24, pointer, true);
+  view.setUint32(descriptor + 28, 0, true);
+  view.setBigUint64(descriptor + 32, 1n, true);
+  view.setBigUint64(descriptor + 40, 1n, true);
+  view.setBigInt64(descriptor + 48, 1n, true);
+}
+const invalid = [
+  () => view.setUint32(descriptor, 1, true),
+  () => view.setUint32(descriptor, 3, true),
+  () => view.setUint32(descriptor + 4, 4, true),
+  () => view.setUint32(descriptor + 4, 2, true),
+  () => view.setUint32(descriptor + 8, 2, true),
+  () => view.setUint32(descriptor + 8, 99, true),
+  () => view.setUint32(descriptor + 12, 2, true),
+  () => view.setUint32(descriptor + 16, 1, true),
+  () => view.setUint32(descriptor + 20, 2, true),
+  () => view.setUint32(descriptor + 20, 9, true),
+  () => view.setUint32(descriptor + 28, 1, true),
+];
+let traps = 0;
+for (const corrupt of invalid) {
+  valid();
+  input[0] = 7;
+  corrupt();
+  try { target(descriptor); } catch (error) {
+    if (error instanceof WebAssembly.RuntimeError && input[0] === 7) traps += 1;
+  }
+}
+for (const invalidPointer of [0, -8, descriptor + 1, memory.buffer.byteLength - 32]) {
+  valid();
+  input[0] = 7;
+  try { target(invalidPointer); } catch (error) {
+    if (error instanceof WebAssembly.RuntimeError && input[0] === 7) traps += 1;
+  }
+}
+console.log(traps);
+"#;
+
+        // When: each corrupt descriptor is passed through the real Wasm export.
+        let value = compile_and_run_node(
+            source,
+            "set_first!",
+            vec![StaticType::Array {
+                element: Box::new(StaticType::U8),
+                ndims: Some(1),
+            }],
+            javascript,
+        );
+
+        // Then: all header violations trap before the sentinel can be stored.
+        assert_eq!(value, "15");
+    }
+
+    #[test]
+    fn wasm_descriptor_v2_rejects_shape_extent_and_index_violations_before_store() {
+        // Given: a rank-2 writer and malformed inline shape, stride, extent, and index cases.
+        let source = "function set_byte!(bytes::Matrix{UInt8}, row::Int64, column::Int64)::Int64\nbytes[row, column] = UInt8(99)\nreturn length(bytes)\nend";
+        let javascript = r#"
+const memory = instance.exports.memory;
+const view = new DataView(memory.buffer);
+const descriptor = 32;
+const pointer = 160;
+const input = new Uint8Array(memory.buffer, pointer, 6);
+const target = instance.exports["set_byte!"];
+function valid() {
+  view.setUint32(descriptor, 2, true);
+  view.setUint32(descriptor + 4, 0, true);
+  view.setUint32(descriptor + 8, 1, true);
+  view.setUint32(descriptor + 12, 1, true);
+  view.setUint32(descriptor + 16, 0, true);
+  view.setUint32(descriptor + 20, 2, true);
+  view.setUint32(descriptor + 24, pointer, true);
+  view.setUint32(descriptor + 28, 0, true);
+  view.setBigUint64(descriptor + 32, 6n, true);
+  view.setBigUint64(descriptor + 40, 2n, true);
+  view.setBigInt64(descriptor + 48, 1n, true);
+  view.setBigUint64(descriptor + 56, 3n, true);
+  view.setBigInt64(descriptor + 64, 2n, true);
+}
+const invalid = [
+  [() => view.setBigUint64(descriptor + 32, 5n, true), 1n, 1n],
+  [() => { view.setBigUint64(descriptor + 40, 0xffffffffffffffffn, true); view.setBigUint64(descriptor + 56, 2n, true); }, 1n, 1n],
+  [() => view.setBigInt64(descriptor + 48, -1n, true), 1n, 1n],
+  [() => { view.setBigUint64(descriptor + 40, 3n, true); view.setBigInt64(descriptor + 48, 0x7fffffffffffffffn, true); }, 1n, 1n],
+  [() => { view.setBigUint64(descriptor + 40, 2n, true); view.setBigUint64(descriptor + 56, 2n, true); view.setBigUint64(descriptor + 32, 4n, true); view.setBigInt64(descriptor + 48, 0x7fffffffffffffffn, true); view.setBigInt64(descriptor + 64, 0x7fffffffffffffffn, true); }, 1n, 1n],
+  [() => view.setUint32(descriptor + 24, memory.buffer.byteLength - 1, true), 1n, 1n],
+  [() => view.setUint32(descriptor + 24, 0, true), 1n, 1n],
+  [() => view.setUint32(descriptor + 24, descriptor + 40, true), 1n, 1n],
+  [() => {}, 3n, 1n],
+  [() => {}, 1n, 4n],
+  [() => { view.setBigUint64(descriptor + 40, 0n, true); view.setBigUint64(descriptor + 32, 0n, true); view.setUint32(descriptor + 24, 0, true); }, 1n, 1n],
+];
+let traps = 0;
+for (const [corrupt, row, column] of invalid) {
+  valid();
+  input.fill(7);
+  corrupt();
+  try { target(descriptor, row, column); } catch (error) {
+    if (error instanceof WebAssembly.RuntimeError && input.every((byte) => byte === 7)) traps += 1;
+  }
+}
+console.log(traps);
+"#;
+
+        // When: Node invokes each malformed descriptor or out-of-bounds index pair.
+        let value = compile_and_run_node(
+            source,
+            "set_byte!",
+            vec![
+                StaticType::Array {
+                    element: Box::new(StaticType::U8),
+                    ndims: Some(2),
+                },
+                StaticType::I64,
+                StaticType::I64,
+            ],
+            javascript,
+        );
+
+        // Then: every case traps before any byte in the host buffer changes.
+        assert_eq!(value, "11");
+    }
+
+    #[test]
+    fn wasm_descriptor_v2_enforces_metadata_extent_and_rank_zero_rules() {
+        // Given: rank-1 and rank-0 length exports with boundary descriptors.
+        let rank_one = compile_and_run_node(
+            "array_len(bytes::Vector{UInt8}) = length(bytes)",
+            "array_len",
+            vec![StaticType::Array {
+                element: Box::new(StaticType::U8),
+                ndims: Some(1),
+            }],
+            "const memory = instance.exports.memory; const view = new DataView(memory.buffer); const descriptor = memory.buffer.byteLength - 40; view.setUint32(descriptor, 2, true); view.setUint32(descriptor + 4, 0, true); view.setUint32(descriptor + 8, 1, true); view.setUint32(descriptor + 12, 1, true); view.setUint32(descriptor + 16, 0, true); view.setUint32(descriptor + 20, 1, true); view.setUint32(descriptor + 24, 0, true); view.setUint32(descriptor + 28, 0, true); view.setBigUint64(descriptor + 32, 0n, true); let trapped = 0; try { instance.exports.array_len(descriptor); } catch (error) { if (error instanceof WebAssembly.RuntimeError) trapped = 1; } console.log(trapped);",
+        );
+        let rank_zero = compile_and_run_node(
+            "array_len(bytes::Array{UInt8,0}) = length(bytes)",
+            "array_len",
+            vec![StaticType::Array {
+                element: Box::new(StaticType::U8),
+                ndims: Some(0),
+            }],
+            "const memory = instance.exports.memory; const view = new DataView(memory.buffer); const descriptor = 32; const pointer = 128; function write(count) { view.setUint32(descriptor, 2, true); view.setUint32(descriptor + 4, 0, true); view.setUint32(descriptor + 8, 1, true); view.setUint32(descriptor + 12, 1, true); view.setUint32(descriptor + 16, 0, true); view.setUint32(descriptor + 20, 0, true); view.setUint32(descriptor + 24, pointer, true); view.setUint32(descriptor + 28, 0, true); view.setBigUint64(descriptor + 32, count, true); } write(1n); const valid = instance.exports.array_len(descriptor); write(0n); let traps = 0; try { instance.exports.array_len(descriptor); } catch (error) { if (error instanceof WebAssembly.RuntimeError) traps += 1; } write(2n); try { instance.exports.array_len(descriptor); } catch (error) { if (error instanceof WebAssembly.RuntimeError) traps += 1; } console.log(`${valid}:${traps}`);",
+        );
+
+        // When: metadata truncation and invalid rank-0 counts cross the boundary.
+        // Then: truncation traps, rank-0 count one passes, and other counts trap.
+        assert_eq!(rank_one, "1");
+        assert_eq!(rank_zero, "1:2");
+    }
+
+    #[test]
+    fn wasm_descriptor_v2_enforces_readonly_and_zero_count_access_rules() {
+        // Given: UInt8 read/write exports and valid readonly or empty descriptors.
+        let readonly_read = compile_and_run_node(
+            "read_first(bytes::Vector{UInt8}) = bytes[1]",
+            "read_first",
+            vec![StaticType::Array {
+                element: Box::new(StaticType::U8),
+                ndims: Some(1),
+            }],
+            "const memory = instance.exports.memory; const view = new DataView(memory.buffer); const descriptor = 32; const pointer = 128; new Uint8Array(memory.buffer, pointer, 1)[0] = 7; view.setUint32(descriptor, 2, true); view.setUint32(descriptor + 4, 2, true); view.setUint32(descriptor + 8, 1, true); view.setUint32(descriptor + 12, 1, true); view.setUint32(descriptor + 16, 0, true); view.setUint32(descriptor + 20, 1, true); view.setUint32(descriptor + 24, pointer, true); view.setUint32(descriptor + 28, 0, true); view.setBigUint64(descriptor + 32, 1n, true); view.setBigUint64(descriptor + 40, 1n, true); view.setBigInt64(descriptor + 48, 1n, true); console.log(instance.exports.read_first(descriptor));",
+        );
+        let module_owned_read = compile_and_run_node(
+            "read_first(bytes::Vector{UInt8}) = bytes[1]",
+            "read_first",
+            vec![StaticType::Array {
+                element: Box::new(StaticType::U8),
+                ndims: Some(1),
+            }],
+            "const memory = instance.exports.memory; const view = new DataView(memory.buffer); const descriptor = 32; const pointer = 128; new Uint8Array(memory.buffer, pointer, 1)[0] = 7; view.setUint32(descriptor, 2, true); view.setUint32(descriptor + 4, 1, true); view.setUint32(descriptor + 8, 1, true); view.setUint32(descriptor + 12, 1, true); view.setUint32(descriptor + 16, 0, true); view.setUint32(descriptor + 20, 1, true); view.setUint32(descriptor + 24, pointer, true); view.setUint32(descriptor + 28, 0, true); view.setBigUint64(descriptor + 32, 1n, true); view.setBigUint64(descriptor + 40, 1n, true); view.setBigInt64(descriptor + 48, 1n, true); console.log(instance.exports.read_first(descriptor));",
+        );
+        let readonly_write = compile_and_run_node(
+            "function write_first!(bytes::Vector{UInt8})::Int64\nbytes[1] = UInt8(99)\nreturn length(bytes)\nend",
+            "write_first!",
+            vec![StaticType::Array {
+                element: Box::new(StaticType::U8),
+                ndims: Some(1),
+            }],
+            "const memory = instance.exports.memory; const view = new DataView(memory.buffer); const descriptor = 32; const pointer = 128; const input = new Uint8Array(memory.buffer, pointer, 1); input[0] = 7; view.setUint32(descriptor, 2, true); view.setUint32(descriptor + 4, 2, true); view.setUint32(descriptor + 8, 1, true); view.setUint32(descriptor + 12, 1, true); view.setUint32(descriptor + 16, 0, true); view.setUint32(descriptor + 20, 1, true); view.setUint32(descriptor + 24, pointer, true); view.setUint32(descriptor + 28, 0, true); view.setBigUint64(descriptor + 32, 1n, true); view.setBigUint64(descriptor + 40, 1n, true); view.setBigInt64(descriptor + 48, 1n, true); let trapped = 0; try { instance.exports[\"write_first!\"](descriptor); } catch (error) { if (error instanceof WebAssembly.RuntimeError) trapped = 1; } console.log(`${trapped}:${input[0]}`);",
+        );
+        let empty = compile_and_run_node(
+            "read_first(bytes::Vector{UInt8}) = bytes[1]",
+            "read_first",
+            vec![StaticType::Array {
+                element: Box::new(StaticType::U8),
+                ndims: Some(1),
+            }],
+            "const view = new DataView(instance.exports.memory.buffer); const descriptor = 32; view.setUint32(descriptor, 2, true); view.setUint32(descriptor + 4, 0, true); view.setUint32(descriptor + 8, 1, true); view.setUint32(descriptor + 12, 1, true); view.setUint32(descriptor + 16, 0, true); view.setUint32(descriptor + 20, 1, true); view.setUint32(descriptor + 24, 0, true); view.setUint32(descriptor + 28, 0, true); view.setBigUint64(descriptor + 32, 0n, true); view.setBigUint64(descriptor + 40, 0n, true); view.setBigInt64(descriptor + 48, 1n, true); let trapped = 0; try { instance.exports.read_first(descriptor); } catch (error) { if (error instanceof WebAssembly.RuntimeError) trapped = 1; } console.log(trapped);",
+        );
+
+        // When: a read and store use READONLY, and an index targets zero elements.
+        // Then: only the read succeeds; both prohibited accesses trap without mutation.
+        assert_eq!(readonly_read, "7");
+        assert_eq!(module_owned_read, "7");
+        assert_eq!(readonly_write, "1:7");
+        assert_eq!(empty, "1");
+    }
+
+    #[test]
+    fn wasm_descriptor_v2_rejects_static_rank_above_limit() {
+        // Given: a statically typed UInt8 array above the ABI rank cap.
+        let source = "array_len(bytes::Array{UInt8,9}) = length(bytes)";
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            c_abi_exports: vec![CAbiExport::with_arg_types(
+                "array_len",
+                "array_len",
+                vec![StaticType::Array {
+                    element: Box::new(StaticType::U8),
+                    ndims: Some(9),
+                }],
+            )],
+            ..CompileConfig::default()
+        };
+
+        // When: the canonical Wasm pipeline validates the static descriptor type.
+        let error = compile_wasm_source(source, &config)
+            .expect_err("rank above MAX_RANK must remain unsupported");
+
+        // Then: rank overflow is a typed compile diagnostic, not a runtime ABI guess.
+        assert!(matches!(error, AotError::UnsupportedInstruction(_)));
+    }
+
+    #[test]
+    fn wasm_descriptor_v2_dimension_limit_is_inclusive_and_traps_before_store() {
+        // Given: a zero-stride view whose one-byte extent isolates dimension validation.
+        let source = "function write_and_length!(bytes::Vector{UInt8})::Int64\nbytes[1] = UInt8(99)\nreturn length(bytes)\nend";
+        let javascript = r#"
+const memory = instance.exports.memory;
+const view = new DataView(memory.buffer);
+const descriptor = 32;
+const pointer = 128;
+const input = new Uint8Array(memory.buffer, pointer, 1);
+function write(dim) {
+  view.setUint32(descriptor, 2, true);
+  view.setUint32(descriptor + 4, 0, true);
+  view.setUint32(descriptor + 8, 1, true);
+  view.setUint32(descriptor + 12, 1, true);
+  view.setUint32(descriptor + 16, 0, true);
+  view.setUint32(descriptor + 20, 1, true);
+  view.setUint32(descriptor + 24, pointer, true);
+  view.setUint32(descriptor + 28, 0, true);
+  view.setBigUint64(descriptor + 32, dim, true);
+  view.setBigUint64(descriptor + 40, dim, true);
+  view.setBigInt64(descriptor + 48, 0n, true);
+}
+write(0x80000000n);
+input[0] = 7;
+const boundary = instance.exports["write_and_length!"](descriptor);
+write(0x80000001n);
+input[0] = 7;
+let trapped = 0;
+try { instance.exports["write_and_length!"](descriptor); } catch (error) {
+  if (error instanceof WebAssembly.RuntimeError && input[0] === 7) trapped = 1;
+}
+console.log(`${boundary}:${trapped}:${input[0]}`);
+"#;
+
+        // When: Node executes the inclusive boundary and then boundary plus one.
+        let value = compile_and_run_node(
+            source,
+            "write_and_length!",
+            vec![StaticType::Array {
+                element: Box::new(StaticType::U8),
+                ndims: Some(1),
+            }],
+            javascript,
+        );
+
+        // Then: 2^31 is accepted and 2^31+1 traps before the sentinel changes.
+        assert_eq!(value, "2147483648:1:7");
+    }
+
+    #[test]
+    fn wasm_descriptor_v2_stride_zero_is_an_aliasing_view() {
+        // Given: a module-owned 2x3 view with both strides zero and one backing byte.
+        let source = "function alias_write!(bytes::Matrix{UInt8})::Int64\nbytes[2, 3] = UInt8(99)\nreturn Int64(bytes[1, 1]) + length(bytes)\nend";
+
+        // When: Node calls the view through a valid ABI v2 descriptor.
+        let value = compile_and_run_node(
+            source,
+            "alias_write!",
+            vec![StaticType::Array {
+                element: Box::new(StaticType::U8),
+                ndims: Some(2),
+            }],
+            "const memory = instance.exports.memory; const view = new DataView(memory.buffer); const descriptor = 32; const pointer = 128; const input = new Uint8Array(memory.buffer, pointer, 1); input[0] = 7; view.setUint32(descriptor, 2, true); view.setUint32(descriptor + 4, 1, true); view.setUint32(descriptor + 8, 1, true); view.setUint32(descriptor + 12, 1, true); view.setUint32(descriptor + 16, 0, true); view.setUint32(descriptor + 20, 2, true); view.setUint32(descriptor + 24, pointer, true); view.setUint32(descriptor + 28, 0, true); view.setBigUint64(descriptor + 32, 6n, true); view.setBigUint64(descriptor + 40, 2n, true); view.setBigInt64(descriptor + 48, 0n, true); view.setBigUint64(descriptor + 56, 3n, true); view.setBigInt64(descriptor + 64, 0n, true); const result = instance.exports[\"alias_write!\"](descriptor); console.log(`${result}:${input[0]}`);",
+        );
+
+        // Then: every logical index aliases the same safe in-bounds byte.
+        assert_eq!(value, "105:99");
+    }
+
+    #[test]
+    fn wasm_u8_address_emission_has_no_unused_max_offset_operand() {
+        // Given: a generated rank-1 load with checked descriptor addressing.
+        let source = "read_first(bytes::Vector{UInt8}) = bytes[1]";
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            c_abi_exports: vec![CAbiExport::with_arg_types(
+                "read_first",
+                "read_first",
+                vec![StaticType::Array {
+                    element: Box::new(StaticType::U8),
+                    ndims: Some(1),
+                }],
+            )],
+            ..CompileConfig::default()
+        };
+        let output = compile_wasm_source(source, &config).expect("rank-1 load should compile");
+
+        // When: the generated operator stream is rendered as canonical WAT.
+        let wat = wasm_text(&output.wasm_bytes);
+        let operators = wat.lines().map(str::trim).collect::<Vec<_>>().join("\n");
+
+        // Then: address multiplication starts from the zero-based index, not max_offset.
+        assert!(
+            !operators
+                .contains("local.get 9\nlocal.get 10\nlocal.get 0\ni64.load offset=48 align=1"),
+            "address emission retained an unused max-offset operand:\n{wat}"
+        );
+    }
+
+    #[test]
+    fn wasm_rgba_node_benchmark_meets_warm_loop_gate() {
+        // Given: the same general RGBA Julia function compiled by the full pipeline.
+        let source = "function invert_rgba!(bytes::Vector{UInt8})\ni = 1\nwhile i <= length(bytes)\nbytes[i] = UInt8(255 - bytes[i])\nbytes[i + 1] = UInt8(255 - bytes[i + 1])\nbytes[i + 2] = UInt8(255 - bytes[i + 2])\ni = i + 4\nend\nreturn length(bytes)\nend";
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            c_abi_exports: vec![CAbiExport::with_arg_types(
+                "invert_rgba!",
+                "invert_rgba!",
+                vec![StaticType::Array {
+                    element: Box::new(StaticType::U8),
+                    ndims: Some(1),
+                }],
+            )],
+            ..CompileConfig::default()
+        };
+        let output =
+            compile_wasm_source(source, &config).expect("RGBA Wasm compilation should succeed");
+        let dir = tempfile::tempdir().expect("create benchmark directory");
+        let wasm_path = dir.path().join("rgba.wasm");
+        fs::write(&wasm_path, output.wasm_bytes).expect("write benchmark Wasm");
+
+        // When: Node benchmarks 20 warm 888x862 RGBA iterations.
+        let result = Command::new("node")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../benchmarks/wasm_aot_rgba.mjs"
+            ))
+            .arg(&wasm_path)
+            .output()
+            .expect("run Node RGBA benchmark");
+
+        // Then: Node enforces the latency gate and emits all requested phases.
+        assert!(
+            result.status.success(),
+            "RGBA benchmark must meet p95 <100ms\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let node_timings = String::from_utf8(result.stdout).expect("benchmark output is UTF-8");
+        assert!(node_timings.contains("compile_ms="));
+        assert!(node_timings.contains("instantiate_ms="));
+        assert!(node_timings.contains("median_ms="));
+        assert!(node_timings.contains("p95_ms="));
+        for (phase, duration) in output.timings {
+            eprintln!("{phase}_ms={:.3}", duration.as_secs_f64() * 1_000.0);
+        }
+        eprintln!("{}", node_timings.trim());
+    }
+
+    #[test]
+    fn wasm_builds_primitive_rectangular_comprehensions() {
+        // Given: one-dimensional, nested rectangular, and empty-axis comprehensions.
+        let source = r#"
+line()::Vector{Int64} = [i * i for i in 1:4]
+grid()::Matrix{Int64} = [i + j for i in 1:2, j in 1:3]
+empty_axis()::Vector{Int64} = [i for i in 1:0]
+"#;
+        let oracle = Command::new("julia")
+            .args([
+                "--startup-file=no",
+                "-e",
+                &format!(
+                    "{source}\nprintln((size(line()), line(), size(grid()), vec(grid()), size(empty_axis()), empty_axis()))"
+                ),
+            ])
+            .output()
+            .expect("run upstream Julia comprehension oracle");
+        assert!(
+            oracle.status.success(),
+            "{}",
+            String::from_utf8_lossy(&oracle.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&oracle.stdout).trim(),
+            "((4,), [1, 4, 9, 16], (2, 3), [2, 3, 3, 4, 4, 5], (0,), Int64[])"
+        );
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            c_abi_exports: ["line", "grid", "empty_axis"]
+                .into_iter()
+                .map(|name| CAbiExport::with_arg_types(name, name, Vec::new()))
+                .collect(),
+            ..CompileConfig::default()
+        };
+
+        // When: generated Wasm allocates each result once and fills it in place.
+        let output = compile_wasm_source(source, &config)
+            .expect("primitive rectangular comprehensions should compile");
+        let javascript = r#"
+const e = instance.exports;
+const decode = pointer => {
+  const view = new DataView(e.memory.buffer);
+  const rank = view.getUint32(pointer + 20, true);
+  const count = Number(view.getBigUint64(pointer + 32, true));
+  const start = view.getUint32(pointer + 24, true);
+  return {
+    flags: view.getUint32(pointer + 4, true),
+    rank,
+    dims: Array.from({length: rank}, (_, axis) => Number(view.getBigUint64(pointer + 40 + axis * 16, true))),
+    strides: Array.from({length: rank}, (_, axis) => Number(view.getBigInt64(pointer + 48 + axis * 16, true))),
+    values: Array.from(new BigInt64Array(e.memory.buffer, start, count), Number),
+  };
+};
+const results = [e.line(), e.grid(), e.empty_axis()];
+const decoded = results.map(decode);
+results.forEach(e.__sjulia_drop);
+console.log(JSON.stringify({ imports: WebAssembly.Module.imports(module).length, decoded }));
+"#;
+        let values = (0..3)
+            .map(|_| run_wasm_bytes_node(&output.wasm_bytes, javascript))
+            .collect::<Vec<_>>();
+
+        // Then: results are module-owned, column-major, and match Julia exactly.
+        assert_eq!(
+            values,
+            vec![
+                r#"{"imports":0,"decoded":[{"flags":1,"rank":1,"dims":[4],"strides":[1],"values":[1,4,9,16]},{"flags":1,"rank":2,"dims":[2,3],"strides":[1,2],"values":[2,3,3,4,4,5]},{"flags":1,"rank":1,"dims":[0],"strides":[1],"values":[]}]}"#;
+                3
+            ]
+        );
+    }
+
+    #[test]
+    fn wasm_broadcasts_scalar_array_trees_over_one_array_operand() {
+        // Given: scalar-array arithmetic, a comparison, a promoting division, a fused
+        // chain and a two-scalar tree over a single rank-one array operand.
+        let source = r#"
+shift(v::Vector{Int32})::Vector{Int32} = v .+ Int32(10)
+compare(v::Vector{Int32})::Vector{Bool} = v .< Int32(3)
+halve(v::Vector{Int32})::Vector{Float64} = v ./ 2
+fused(v::Vector{Int32})::Vector{Float64} = clamp.(v ./ 2 .+ 1.0, 1.5, 3.0)
+two(v::Vector{Int32})::Vector{Int32} = v .+ Int32(2) .* Int32(3)
+"#;
+        let oracle = Command::new("julia")
+            .args([
+                "--startup-file=no",
+                "-e",
+                &format!(
+                    "{source}\nv = Int32[1,2,3,4]\nprintln(join([string(eltype(x), \" \", x) for x in (shift(v), compare(v), halve(v), fused(v), two(v))], \" | \"))"
+                ),
+            ])
+            .output()
+            .expect("run upstream Julia broadcast oracle");
+        assert!(
+            oracle.status.success(),
+            "{}",
+            String::from_utf8_lossy(&oracle.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&oracle.stdout).trim(),
+            "Int32 Int32[11, 12, 13, 14] | Bool Bool[1, 1, 0, 0] | Float64 [0.5, 1.0, 1.5, 2.0] | Float64 [1.5, 2.0, 2.5, 3.0] | Int32 Int32[7, 8, 9, 10]"
+        );
+        let vector = StaticType::Array {
+            element: Box::new(StaticType::I32),
+            ndims: Some(1),
+        };
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            c_abi_exports: ["shift", "compare", "halve", "fused", "two"]
+                .into_iter()
+                .map(|name| CAbiExport::with_arg_types(name, name, vec![vector.clone()]))
+                .collect(),
+            ..CompileConfig::default()
+        };
+
+        // When: Node drives contiguous, empty, and noncontiguous read-only inputs.
+        let output = compile_wasm_source(source, &config)
+            .expect("single-array broadcast trees should compile");
+        let javascript = r#"
+const e = instance.exports;
+const view = new DataView(e.memory.buffer);
+const describe = (at, flags, data, count, dim, stride) => {
+  view.setUint32(at, 2, true);
+  view.setUint32(at + 4, flags, true);
+  view.setUint32(at + 8, 6, true);
+  view.setUint32(at + 12, 4, true);
+  view.setUint32(at + 16, 0, true);
+  view.setUint32(at + 20, 1, true);
+  view.setUint32(at + 24, data, true);
+  view.setUint32(at + 28, 0, true);
+  view.setBigUint64(at + 32, BigInt(count), true);
+  view.setBigUint64(at + 40, BigInt(dim), true);
+  view.setBigInt64(at + 48, BigInt(stride), true);
+  return at;
+};
+const dense = describe(32, 0, 256, 4, 4, 1);
+const empty = describe(96, 0, 0, 0, 0, 1);
+const strided = describe(160, 2, 384, 3, 3, 2);
+new Int32Array(e.memory.buffer, 256, 4).set([1, 2, 3, 4]);
+new Int32Array(e.memory.buffer, 384, 6).set([1, 2, 3, 4, 5, 6]);
+const decode = pointer => {
+  const current = new DataView(e.memory.buffer);
+  const tag = current.getUint32(pointer + 8, true);
+  const rank = current.getUint32(pointer + 20, true);
+  const count = Number(current.getBigUint64(pointer + 32, true));
+  const start = current.getUint32(pointer + 24, true);
+  const buffer = e.memory.buffer;
+  const values = tag === 6 ? Array.from(new Int32Array(buffer, start, count))
+    : tag === 10 ? Array.from(new Float64Array(buffer, start, count))
+    : Array.from(new Uint8Array(buffer, start, count));
+  return {
+    tag,
+    flags: current.getUint32(pointer + 4, true),
+    dims: Array.from({length: rank}, (_, axis) => Number(current.getBigUint64(pointer + 40 + axis * 16, true))),
+    strides: Array.from({length: rank}, (_, axis) => Number(current.getBigInt64(pointer + 48 + axis * 16, true))),
+    values,
+  };
+};
+const results = [
+  e.shift(dense), e.compare(dense), e.halve(dense), e.fused(dense), e.two(dense),
+  e.shift(empty), e.shift(strided),
+];
+const decoded = results.map(decode);
+const inputs = [
+  Array.from(new Int32Array(e.memory.buffer, 256, 4)),
+  Array.from(new Int32Array(e.memory.buffer, 384, 6)),
+];
+results.forEach(e.__sjulia_drop);
+console.log(JSON.stringify({ imports: WebAssembly.Module.imports(module).length, inputs, decoded }));
+"#;
+        let values = (0..3)
+            .map(|_| run_wasm_bytes_node(&output.wasm_bytes, javascript))
+            .collect::<Vec<_>>();
+
+        // Then: every result is a module-owned contiguous array carrying Julia's
+        // element type, empty and strided sources are honoured, and no input changes.
+        assert_eq!(
+            values,
+            vec![
+                r#"{"imports":0,"inputs":[[1,2,3,4],[1,2,3,4,5,6]],"decoded":[{"tag":6,"flags":1,"dims":[4],"strides":[1],"values":[11,12,13,14]},{"tag":11,"flags":1,"dims":[4],"strides":[1],"values":[1,1,0,0]},{"tag":10,"flags":1,"dims":[4],"strides":[1],"values":[0.5,1,1.5,2]},{"tag":10,"flags":1,"dims":[4],"strides":[1],"values":[1.5,2,2.5,3]},{"tag":6,"flags":1,"dims":[4],"strides":[1],"values":[7,8,9,10]},{"tag":6,"flags":1,"dims":[0],"strides":[1],"values":[]},{"tag":6,"flags":1,"dims":[3],"strides":[1],"values":[11,13,15]}]}"#;
+                3
+            ]
+        );
+    }
+
+    #[test]
+    fn wasm_rejects_multi_array_broadcast_before_codegen() {
+        // Given: same-shape two-array broadcast, which shared AoT specialization
+        // rewrites away before the Wasm backend can plan a shape for it.
+        let source = "add(v::Vector{Int32}, w::Vector{Int32})::Vector{Int32} = v .+ w";
+        let vector = StaticType::Array {
+            element: Box::new(StaticType::I32),
+            ndims: Some(1),
+        };
+        let config = CompileConfig {
+            backend: AotBackend::Wasm,
+            c_abi_exports: vec![CAbiExport::with_arg_types(
+                "add",
+                "add",
+                vec![vector.clone(), vector],
+            )],
+            ..CompileConfig::default()
+        };
+
+        // When: the Wasm backend compiles it.
+        let error = compile_wasm_source(source, &config)
+            .expect_err("multi-array broadcast must not be miscompiled");
+
+        // Then: it is a typed unsupported diagnostic rather than a wrong result.
+        assert!(matches!(error, AotError::UnsupportedInstruction(_)));
+    }
 }

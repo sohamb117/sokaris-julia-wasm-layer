@@ -4,6 +4,8 @@
 //! constant value, and IR function/module types.
 
 use super::super::types::StaticType;
+use super::aggregate_types::AggregateLayout;
+use super::{AotBuiltinOp, ConstValue};
 use std::fmt;
 
 #[derive(Debug, Clone)]
@@ -41,9 +43,15 @@ impl BasicBlock {
 #[derive(Debug, Clone)]
 pub enum Instruction {
     /// Load a constant value
-    LoadConst { dest: VarRef, value: ConstValue },
+    LoadConst {
+        dest: VarRef,
+        value: ConstValue,
+    },
     /// Copy a value
-    Copy { dest: VarRef, src: VarRef },
+    Copy {
+        dest: VarRef,
+        src: VarRef,
+    },
     /// Binary operation
     BinOp {
         dest: VarRef,
@@ -57,6 +65,19 @@ pub enum Instruction {
         op: UnaryOpKind,
         operand: VarRef,
     },
+    Builtin {
+        dest: VarRef,
+        op: AotBuiltinOp,
+        args: Vec<VarRef>,
+    },
+    Rand {
+        dest: VarRef,
+        dims: Vec<VarRef>,
+    },
+    Randn {
+        dest: VarRef,
+        dims: Vec<VarRef>,
+    },
     /// Function call
     Call {
         dest: Option<VarRef>,
@@ -69,9 +90,31 @@ pub enum Instruction {
         func: String,
         args: Vec<VarRef>,
     },
+    ArrayNew {
+        dest: VarRef,
+        dims: Vec<VarRef>,
+        init: ArrayInit,
+    },
+    ArraySlice {
+        dest: VarRef,
+        source: VarRef,
+        selectors: Vec<ArraySelector>,
+        dims: Vec<VarRef>,
+    },
+    UnitRangeLength {
+        dest: VarRef,
+        start: VarRef,
+        stop: VarRef,
+    },
+    ArraySliceAssign {
+        array: VarRef,
+        selectors: Vec<ArraySelector>,
+        value: VarRef,
+    },
     /// Stack-allocated isbits struct construction.
     StructNew {
         dest: VarRef,
+        layout_id: u32,
         size: u32,
         align: u8,
         fields: Vec<StructFieldInit>,
@@ -80,12 +123,12 @@ pub enum Instruction {
     GetIndex {
         dest: VarRef,
         array: VarRef,
-        index: VarRef,
+        indices: Vec<VarRef>,
     },
     /// Array/collection mutation
     SetIndex {
         array: VarRef,
-        index: VarRef,
+        indices: Vec<VarRef>,
         value: VarRef,
     },
     /// Field access
@@ -98,6 +141,7 @@ pub enum Instruction {
     GetFieldOffset {
         dest: VarRef,
         object: VarRef,
+        layout_id: u32,
         offset: i32,
     },
     /// Field mutation
@@ -123,6 +167,18 @@ pub enum Instruction {
         dest: VarRef,
         incoming: Vec<(String, VarRef)>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrayInit {
+    Zero,
+    One,
+}
+
+#[derive(Debug, Clone)]
+pub enum ArraySelector {
+    Scalar(VarRef),
+    UnitRange { start: VarRef, stop: VarRef },
 }
 
 #[derive(Debug, Clone)]
@@ -191,35 +247,6 @@ impl fmt::Display for VarRef {
             write!(f, "%{}", self.name)
         } else {
             write!(f, "%{}.{}", self.name, self.version)
-        }
-    }
-}
-
-/// Constant value
-#[derive(Debug, Clone, PartialEq)]
-pub enum ConstValue {
-    Int64(i64),
-    Int32(i32),
-    Float64(f64),
-    Float32(f32),
-    Bool(bool),
-    Char(char),
-    String(String),
-    Nothing,
-}
-
-impl ConstValue {
-    /// Get the type of this constant
-    pub fn get_type(&self) -> StaticType {
-        match self {
-            ConstValue::Int64(_) => StaticType::I64,
-            ConstValue::Int32(_) => StaticType::I32,
-            ConstValue::Float64(_) => StaticType::F64,
-            ConstValue::Float32(_) => StaticType::F32,
-            ConstValue::Bool(_) => StaticType::Bool,
-            ConstValue::Char(_) => StaticType::Char,
-            ConstValue::String(_) => StaticType::Str,
-            ConstValue::Nothing => StaticType::Nothing,
         }
     }
 }
@@ -314,6 +341,7 @@ pub struct IrModule {
     pub name: String,
     /// Functions in this module
     pub functions: Vec<IrFunction>,
+    pub layouts: Vec<AggregateLayout>,
 }
 
 impl IrModule {
@@ -322,6 +350,7 @@ impl IrModule {
         Self {
             name,
             functions: Vec::new(),
+            layouts: Vec::new(),
         }
     }
 

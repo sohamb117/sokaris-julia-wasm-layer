@@ -396,16 +396,18 @@ impl AotBuiltinOp {
     pub fn return_type(&self, arg_types: &[StaticType]) -> StaticType {
         match self {
             // Float-returning math functions
-            AotBuiltinOp::Sqrt
-            | AotBuiltinOp::Sin
+            AotBuiltinOp::Sin
             | AotBuiltinOp::Cos
             | AotBuiltinOp::Tan
             | AotBuiltinOp::Asin
             | AotBuiltinOp::Acos
             | AotBuiltinOp::Atan
-            | AotBuiltinOp::Atan2
-            | AotBuiltinOp::Exp
-            | AotBuiltinOp::Log => StaticType::F64,
+            | AotBuiltinOp::Atan2 => StaticType::F64,
+
+            AotBuiltinOp::Sqrt | AotBuiltinOp::Exp | AotBuiltinOp::Log => match arg_types.first() {
+                Some(StaticType::F32) => StaticType::F32,
+                _ => StaticType::F64,
+            },
 
             AotBuiltinOp::Rand | AotBuiltinOp::Randn => {
                 if arg_types.is_empty() {
@@ -501,7 +503,7 @@ impl AotBuiltinOp {
                 _ => StaticType::F64,
             },
 
-            // Size returns tuple
+            AotBuiltinOp::Size if arg_types.len() == 2 => StaticType::I64,
             AotBuiltinOp::Size => StaticType::Tuple(vec![StaticType::I64]),
 
             // Push/Pop return array or element

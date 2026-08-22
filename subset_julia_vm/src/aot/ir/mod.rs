@@ -7,19 +7,28 @@
 //! - `ops.rs`: Operator types (AotBinOp, AotUnaryOp, AotBuiltinOp) + Display/From
 //! - `tests.rs`: Tests
 
+mod aggregate_types;
 mod aot_types;
 mod basic_types;
+mod broadcast;
 mod ops;
 #[cfg(test)]
 mod tests;
+mod values;
 
 // Re-export all public types
+pub use aggregate_types::{AggregateField, AggregateLayout};
 pub use aot_types::{
     AotEnum, AotExpr, AotFunction, AotGlobal, AotInlinePolicy, AotProgram, AotStmt, AotStruct,
     DynamicOpDiagnostic,
 };
 pub use basic_types::{
-    BasicBlock, BinOpKind, ConstValue, Instruction, IrFunction, IrModule, StructFieldInit,
-    Terminator, UnaryOpKind, VarRef,
+    ArrayInit, ArraySelector, BasicBlock, BinOpKind, Instruction, IrFunction, IrModule,
+    StructFieldInit, Terminator, UnaryOpKind, VarRef,
+};
+pub use broadcast::{
+    node_ty as broadcast_node_ty, plan as broadcast_plan, BroadcastNode, BroadcastOp,
+    BroadcastPlan, BroadcastReject,
 };
 pub use ops::{AotBinOp, AotBuiltinOp, AotUnaryOp, CompoundAssignOp};
+pub use values::ConstValue;

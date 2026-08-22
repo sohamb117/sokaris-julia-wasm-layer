@@ -952,6 +952,12 @@ fn compile_instruction(
             var_map.insert(var_key(dest), result);
         }
 
+        Instruction::Builtin { op, .. } => {
+            return Err(CraneliftError::Unsupported(format!(
+                "Cranelift backend does not yet lower structural builtin `{op}`"
+            )));
+        }
+
         Instruction::Call { dest, func, args } => {
             if let Some(&func_ref) = compile_ctx.func_refs.get(func) {
                 let arg_vals: Vec<Value> = args
@@ -1020,6 +1026,7 @@ fn compile_instruction(
 
         Instruction::StructNew {
             dest,
+            layout_id: _,
             size,
             align,
             fields,
@@ -1067,6 +1074,7 @@ fn compile_instruction(
         Instruction::GetFieldOffset {
             dest,
             object,
+            layout_id: _,
             offset,
         } => {
             let obj_val = get_var(var_map, object)?;
@@ -2249,7 +2257,7 @@ mod tests {
         func.entry_block_mut().unwrap().push(Instruction::GetIndex {
             dest: dest.clone(),
             array,
-            index,
+            indices: vec![index],
         });
         func.entry_block_mut()
             .unwrap()
@@ -2278,7 +2286,7 @@ mod tests {
         let value = VarRef::new("value".to_string(), StaticType::I64);
         func.entry_block_mut().unwrap().push(Instruction::SetIndex {
             array,
-            index,
+            indices: vec![index],
             value,
         });
         func.entry_block_mut()

@@ -35,6 +35,10 @@ use subset_julia_vm::lowering::Lowering;
 use subset_julia_vm::parser::{ParseOutcome, Parser, RustParsedSource};
 use subset_julia_vm::span::Span;
 
+#[cfg(feature = "aot-wasm")]
+#[path = "../aot_wasm_cli.rs"]
+mod aot_wasm;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Process exit codes, classified by failure category (Issue #6997) so that
@@ -58,7 +62,7 @@ mod exit_code {
 /// Map an [`AotError`] to its classified exit code.
 fn exit_code_for(err: &AotError) -> i32 {
     match err {
-        AotError::ParseError(_) | AotError::LoweringError(_) => exit_code::PARSE,
+        AotError::ParseError { .. } | AotError::LoweringError { .. } => exit_code::PARSE,
         AotError::UnsupportedInstruction(_) => exit_code::UNSUPPORTED,
         AotError::CodegenError(_) => exit_code::CODEGEN,
         AotError::TypeInferenceError(_)
@@ -83,6 +87,32 @@ fn get_method_signature(func: &subset_julia_vm::ir::core::Function) -> String {
 enum Backend {
     Rust,
     Cranelift,
+    #[cfg(feature = "aot-wasm")]
+    Wasm,
+}
+
+impl Backend {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "rust" => Ok(Self::Rust),
+            "cranelift" => Ok(Self::Cranelift),
+            #[cfg(feature = "aot-wasm")]
+            "wasm" => Ok(Self::Wasm),
+            other => Err(format!(
+                "--backend requires {} (got {})",
+                backend_values(),
+                other
+            )),
+        }
+    }
+}
+
+const fn backend_values() -> &'static str {
+    if cfg!(feature = "aot-wasm") {
+        "rust|cranelift|wasm"
+    } else {
+        "rust|cranelift"
+    }
 }
 
 impl From<Backend> for AotBackend {
@@ -90,6 +120,8 @@ impl From<Backend> for AotBackend {
         match value {
             Backend::Rust => AotBackend::Rust,
             Backend::Cranelift => AotBackend::Cranelift,
+            #[cfg(feature = "aot-wasm")]
+            Backend::Wasm => AotBackend::Wasm,
         }
     }
 }
@@ -198,21 +230,26 @@ fn split_c_abi_export_specs(value: &str) -> Result<Vec<&str>, String> {
 }
 
 fn parse_c_abi_type_name(value: &str) -> Result<StaticType, String> {
-    match value.trim() {
-        "Int64" => Ok(StaticType::I64),
-        "Int32" => Ok(StaticType::I32),
-        "Int16" => Ok(StaticType::I16),
-        "Int8" => Ok(StaticType::I8),
-        "UInt64" => Ok(StaticType::U64),
-        "UInt32" => Ok(StaticType::U32),
-        "UInt16" => Ok(StaticType::U16),
-        "UInt8" => Ok(StaticType::U8),
-        "Float64" => Ok(StaticType::F64),
-        "Float32" => Ok(StaticType::F32),
-        "Bool" => Ok(StaticType::Bool),
-        "Nothing" => Ok(StaticType::Nothing),
-        other => Err(format!(
-            "--export-c-abi signature type `{other}` is not supported; use a concrete C-stable scalar type such as Int64, Float64, or Bool"
+    let name = value.trim();
+    let parsed = StaticType::from_julia_name_lossy(name);
+    match parsed {
+        Some(
+            ty @ (StaticType::I64
+            | StaticType::I32
+            | StaticType::I16
+            | StaticType::I8
+            | StaticType::U64
+            | StaticType::U32
+            | StaticType::U16
+            | StaticType::U8
+            | StaticType::F64
+            | StaticType::F32
+            | StaticType::Bool
+            | StaticType::Nothing
+            | StaticType::Array { .. }),
+        ) => Ok(ty),
+        Some(_) | None => Err(format!(
+            "--export-c-abi signature type `{name}` is not supported; use a C-stable scalar or typed array"
         )),
     }
 }
@@ -299,6 +336,8 @@ struct Args {
     emit_object: Option<String>,
     /// Emit a Cranelift static/shared library at this path.
     emit_library: Option<String>,
+    #[cfg(feature = "aot-wasm")]
+    emit_wasm: Option<String>,
     /// Library output kind for --emit-library.
     library_kind: LibraryKind,
     /// Whether --library-kind was explicitly specified.
@@ -354,6 +393,8 @@ impl Args {
             emit_binary: None,
             emit_object: None,
             emit_library: None,
+            #[cfg(feature = "aot-wasm")]
+            emit_wasm: None,
             library_kind: LibraryKind::Static,
             library_kind_specified: false,
             target: None,
@@ -449,6 +490,22 @@ impl Args {
                     }
                     parsed.emit_library = Some(value.to_string());
                 }
+                #[cfg(feature = "aot-wasm")]
+                "--emit-wasm" => {
+                    i += 1;
+                    match args.get(i) {
+                        Some(value) if !value.is_empty() => parsed.emit_wasm = Some(value.clone()),
+                        _ => return Err("--emit-wasm requires an output Wasm path".to_string()),
+                    }
+                }
+                #[cfg(feature = "aot-wasm")]
+                arg if arg.starts_with("--emit-wasm=") => {
+                    let value = arg.trim_start_matches("--emit-wasm=");
+                    if value.is_empty() {
+                        return Err("--emit-wasm requires an output Wasm path".to_string());
+                    }
+                    parsed.emit_wasm = Some(value.to_string());
+                }
                 "--library-kind" => {
                     i += 1;
                     match args.get(i) {
@@ -517,28 +574,11 @@ impl Args {
                 }
                 "--backend" => {
                     i += 1;
-                    parsed.backend = match args.get(i).map(String::as_str) {
-                        Some("rust") => Backend::Rust,
-                        Some("cranelift") => Backend::Cranelift,
-                        other => {
-                            return Err(format!(
-                                "--backend requires rust|cranelift (got {:?})",
-                                other.unwrap_or("<missing>")
-                            ))
-                        }
-                    };
+                    parsed.backend =
+                        Backend::parse(args.get(i).map(String::as_str).unwrap_or("<missing>"))?;
                 }
                 arg if arg.starts_with("--backend=") => {
-                    parsed.backend = match arg.trim_start_matches("--backend=") {
-                        "rust" => Backend::Rust,
-                        "cranelift" => Backend::Cranelift,
-                        other => {
-                            return Err(format!(
-                                "--backend requires rust|cranelift (got {})",
-                                other
-                            ))
-                        }
-                    };
+                    parsed.backend = Backend::parse(arg.trim_start_matches("--backend="))?;
                 }
                 "--diagnostic-format" => {
                     i += 1;
@@ -635,6 +675,35 @@ impl Args {
             return Err(
                 "--target requires --emit-binary, --emit-object, or --emit-library".to_string(),
             );
+        }
+        #[cfg(feature = "aot-wasm")]
+        if parsed.backend == Backend::Wasm {
+            if parsed.emit_wasm.is_none() {
+                return Err("--backend wasm requires --emit-wasm PATH".to_string());
+            }
+            if parsed.ir_file.is_some() {
+                return Err("--backend wasm does not accept --ir; provide Julia source".to_string());
+            }
+            if parsed.output_file.is_some()
+                || parsed.emit_binary.is_some()
+                || parsed.emit_object.is_some()
+                || parsed.emit_library.is_some()
+            {
+                return Err(
+                    "--emit-wasm cannot be combined with Rust or native artifact outputs"
+                        .to_string(),
+                );
+            }
+            if parsed.check || parsed.jit_run || parsed.target.is_some() || parsed.minimal_prelude {
+                return Err(
+                    "--backend wasm cannot be combined with --check, --jit-run, --target, or --minimal-prelude"
+                        .to_string(),
+                );
+            }
+        }
+        #[cfg(feature = "aot-wasm")]
+        if parsed.emit_wasm.is_some() && parsed.backend != Backend::Wasm {
+            return Err("--emit-wasm requires --backend wasm".to_string());
         }
         if parsed.library_kind_specified && parsed.emit_library.is_none() {
             return Err("--library-kind requires --emit-library".to_string());
@@ -757,8 +826,8 @@ OPTIONS:
         --diagnostic-format F
                       Diagnostic format: human (default) | json
         --color WHEN   Human diagnostic colors: auto (default) | always | never
-        --backend B   Code generation backend: rust (default) | cranelift (experimental)
-        --dump-aot-stage S  Dump AoT IR at a named stage or `all`
+        --backend B   Code generation backend: {}
+{}        --dump-aot-stage S  Dump AoT IR at a named stage or `all`
         --comments    Emit debug comments in generated code
         --debug-info  With --backend cranelift native artifact output, emit DWARF debug info
         --pure-rust   Generate standalone Rust (fails if dynamic dispatch needed)
@@ -776,7 +845,7 @@ EXAMPLES:
     juliars input.jl --backend cranelift --emit-binary ./program
     juliars input.jl --backend cranelift --emit-object ./program.o
     juliars input.jl --backend cranelift --emit-library ./libprogram.a --library-kind static
-    juliars input.jl --emit-binary ./program --target aarch64-apple-ios-sim
+{}    juliars input.jl --emit-binary ./program --target aarch64-apple-ios-sim
     juliars input.jl --export-c-abi add_i64=add(Int64,Int64)
     juliars input.jl -o output.rs --emit-binary ./program
     juliars -e "function add(x, y) x + y end" -o add.rs
@@ -788,8 +857,27 @@ GENERATED CODE:
     Output depending on the runtime links against subset_julia_vm_runtime;
     --pure-rust output compiles standalone.
 "#,
-        VERSION
+        VERSION,
+        backend_values(),
+        wasm_help(),
+        wasm_example(),
     );
+}
+
+const fn wasm_help() -> &'static str {
+    if cfg!(feature = "aot-wasm") {
+        "        --emit-wasm PATH\n                      With --backend wasm, atomically emit a standalone Wasm module at PATH\n"
+    } else {
+        ""
+    }
+}
+
+const fn wasm_example() -> &'static str {
+    if cfg!(feature = "aot-wasm") {
+        "    juliars input.jl --backend wasm --emit-wasm ./program.wasm\n"
+    } else {
+        ""
+    }
 }
 
 fn print_version() {
@@ -951,7 +1039,10 @@ fn parse_source_with_diagnostics(source: &str) -> Result<ParseOutcome, Box<Sourc
             .and_then(|error| error.span().map(Span::from_parser_span));
         let message = format_parse_errors(&errors);
         return Err(Box::new(SourceDiagnostic::new(
-            AotError::ParseError(message),
+            AotError::ParseError {
+                message,
+                span: None,
+            },
             span,
         )));
     }
@@ -1002,7 +1093,10 @@ fn build_program(source: &str, minimal_prelude: bool) -> Result<Program, Box<Sou
     let mut lowering = Lowering::new(source);
     let mut program = lowering.lower(outcome).map_err(|e| {
         Box::new(SourceDiagnostic::new(
-            AotError::LoweringError(format_lowering_error(&e)),
+            AotError::LoweringError {
+                message: format_lowering_error(&e),
+                span: Some(e.span),
+            },
             Some(e.span),
         ))
     })?;
@@ -1169,16 +1263,28 @@ struct SourceDiagnostic {
 impl SourceDiagnostic {
     fn new(error: AotError, span: Option<Span>) -> Self {
         match error {
-            AotError::ParseError(message) => Self {
-                error: AotError::ParseError(message.clone()),
+            AotError::ParseError {
                 message,
-                span,
+                span: error_span,
+            } => Self {
+                error: AotError::ParseError {
+                    message: message.clone(),
+                    span: error_span,
+                },
+                message,
+                span: error_span.or(span),
                 workaround: None,
             },
-            AotError::LoweringError(message) => Self {
-                error: AotError::LoweringError(message.clone()),
+            AotError::LoweringError {
                 message,
-                span,
+                span: error_span,
+            } => Self {
+                error: AotError::LoweringError {
+                    message: message.clone(),
+                    span: error_span,
+                },
+                message,
+                span: error_span.or(span),
                 workaround: None,
             },
             other => Self::from_error(other),
@@ -1246,8 +1352,8 @@ impl From<Span> for JsonSpan {
 
 fn diagnostic_kind(error: &AotError) -> &'static str {
     match error {
-        AotError::ParseError(_) => "parse",
-        AotError::LoweringError(_) => "lowering",
+        AotError::ParseError { .. } => "parse",
+        AotError::LoweringError { .. } => "lowering",
         AotError::UnsupportedInstruction(_) => "unsupported",
         AotError::CodegenError(_) => "codegen",
         AotError::TypeInferenceError(_) => "type-inference",
@@ -1345,6 +1451,11 @@ fn run() -> i32 {
         return exit_code::SUCCESS;
     }
 
+    #[cfg(feature = "aot-wasm")]
+    if args.backend == Backend::Wasm {
+        return aot_wasm::run(&args);
+    }
+
     let resolved = match resolve_program(&args) {
         Ok(v) => v,
         Err(code) => return code,
@@ -1359,6 +1470,7 @@ fn run() -> i32 {
         opt_level: args.opt_level,
         dump_stage: args.dump_aot_stage.clone(),
         c_abi_exports: args.c_abi_exports.clone(),
+        wasm_imports: Vec::new(),
     };
 
     if let Some(object_target) = &args.emit_object {
@@ -2010,6 +2122,49 @@ mod tests {
         assert!(Args::parse_from(["juliars", "--backend", "llvm", "in.jl"]).is_err());
     }
 
+    #[cfg(feature = "aot-wasm")]
+    #[test]
+    fn parse_accepts_wasm_backend_with_wasm_output() {
+        // Given: the Todo 3b Wasm backend and required binary output path.
+        // When: the typed CLI boundary parses the request.
+        let args = Args::parse_from(["juliars", "--backend=wasm", "--emit-wasm=out.wasm", "in.jl"])
+            .expect("aot-wasm builds should accept Wasm output");
+
+        // Then: neither option can silently fall back to a native backend.
+        assert_eq!(args.backend, Backend::Wasm);
+        assert_eq!(args.emit_wasm.as_deref(), Some("out.wasm"));
+    }
+
+    #[cfg(feature = "aot-wasm")]
+    #[test]
+    fn parse_rejects_incomplete_or_conflicting_wasm_output() {
+        // Given: Wasm requests missing their paired option or mixed with native output.
+        let cases = [
+            vec!["juliars", "--backend=wasm", "in.jl"],
+            vec!["juliars", "--emit-wasm=out.wasm", "in.jl"],
+            vec!["juliars", "in.jl", "--backend=wasm", "--emit-wasm"],
+            vec!["juliars", "in.jl", "--backend=wasm", "--emit-wasm="],
+            vec![
+                "juliars",
+                "--backend=wasm",
+                "--emit-wasm=out.wasm",
+                "-o",
+                "out.rs",
+                "in.jl",
+            ],
+        ];
+
+        // When: each invalid boundary request is parsed.
+        let errors = cases
+            .into_iter()
+            .map(Args::parse_from)
+            .map(|result| result.expect_err("invalid Wasm request must fail"))
+            .collect::<Vec<_>>();
+
+        // Then: every request is rejected instead of selecting another backend.
+        assert!(errors.iter().all(|error| error.contains("wasm")));
+    }
+
     #[test]
     fn parse_cranelift_jit_run_option_issue_7131() {
         assert!(Args::parse_from(["juliars", "--backend=cranelift", "--jit-run", "in.jl"]).is_ok());
@@ -2381,6 +2536,24 @@ mod tests {
             Some(vec![StaticType::F64, StaticType::F64])
         );
 
+        let args = Args::parse_from([
+            "juliars",
+            "in.jl",
+            "--export-c-abi=update=update!(Matrix{UInt8},Int64,Int64)",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.c_abi_exports[0].arg_types,
+            Some(vec![
+                StaticType::Array {
+                    element: Box::new(StaticType::U8),
+                    ndims: Some(2),
+                },
+                StaticType::I64,
+                StaticType::I64,
+            ])
+        );
+
         assert!(Args::parse_from(["juliars", "in.jl", "--export-c-abi=add(Int64)"]).is_err());
         assert!(
             Args::parse_from(["juliars", "in.jl", "--export-c-abi=sjulia_add=add(String)"])
@@ -2492,6 +2665,7 @@ mod tests {
             opt_level: OptLevel::O2,
             dump_stage: None,
             c_abi_exports: Vec::new(),
+            wasm_imports: Vec::new(),
         };
 
         let result = match compile_program(program, &config) {
@@ -2515,7 +2689,7 @@ mod tests {
             Err(diagnostic) => diagnostic,
             Ok(_) => panic!("expected parse error"),
         };
-        assert!(matches!(&diagnostic.error, AotError::ParseError(_)));
+        assert!(matches!(&diagnostic.error, AotError::ParseError { .. }));
         assert!(!diagnostic.message.contains("ParseFailed"));
         assert!(!diagnostic.message.contains("Span {"));
         assert!(diagnostic
@@ -2546,8 +2720,13 @@ mod tests {
         assert!(!message.contains("UnsupportedFeature"));
         assert!(message.contains("Unsupported feature: unsupported assignment target at 1:1"));
 
-        let diagnostic =
-            SourceDiagnostic::new(AotError::LoweringError(message.clone()), Some(err.span));
+        let diagnostic = SourceDiagnostic::new(
+            AotError::LoweringError {
+                message: message.clone(),
+                span: Some(err.span),
+            },
+            Some(err.span),
+        );
         let rendered = render_cli_diagnostic(
             &diagnostic,
             "<eval>",
@@ -2563,7 +2742,10 @@ mod tests {
     #[test]
     fn exit_codes_are_classified() {
         assert_eq!(
-            exit_code_for(&AotError::ParseError("x".into())),
+            exit_code_for(&AotError::ParseError {
+                message: "x".into(),
+                span: None,
+            }),
             exit_code::PARSE
         );
         assert_eq!(

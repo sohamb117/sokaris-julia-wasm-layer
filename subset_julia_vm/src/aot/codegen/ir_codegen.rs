@@ -198,6 +198,26 @@ impl RustCodeGenerator {
                     dest_name, ty, op_str, operand_name
                 ));
             }
+            Instruction::Builtin { dest, op, args } => {
+                let dest_name = self.var_to_rust(dest);
+                let args = args
+                    .iter()
+                    .map(|arg| self.var_to_rust(arg))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let ty = self.type_to_rust(&dest.ty);
+                self.write_line(&format!("let {dest_name}: {ty} = {op}({args});"));
+            }
+            Instruction::Rand { dest, dims: _ } => {
+                let dest_name = self.var_to_rust(dest);
+                let ty = self.type_to_rust(&dest.ty);
+                self.write_line(&format!("let {dest_name}: {ty} = __sjulia_aot_rand();"));
+            }
+            Instruction::Randn { dest, dims: _ } => {
+                let dest_name = self.var_to_rust(dest);
+                let ty = self.type_to_rust(&dest.ty);
+                self.write_line(&format!("let {dest_name}: {ty} = __sjulia_aot_randn();"));
+            }
             Instruction::Call { dest, func, args } => {
                 let args_str: Vec<_> = args.iter().map(|a| self.var_to_rust(a)).collect();
                 let call = format!("{}({})", func, args_str.join(", "));
@@ -221,6 +241,7 @@ impl RustCodeGenerator {
             }
             Instruction::StructNew {
                 dest,
+                layout_id: _,
                 size,
                 align,
                 fields,
@@ -234,27 +255,64 @@ impl RustCodeGenerator {
                     fields.len()
                 ));
             }
-            Instruction::GetIndex { dest, array, index } => {
+            Instruction::ArrayNew { dest, dims, init } => {
+                let dest_name = self.var_to_rust(dest);
+                self.write_line(&format!(
+                    "// array {} allocation: rank={}, init={:?}",
+                    dest_name,
+                    dims.len(),
+                    init
+                ));
+            }
+            Instruction::ArraySlice { dest, .. } => {
+                let dest_name = self.var_to_rust(dest);
+                self.write_line(&format!("// array {} slice copy", dest_name));
+            }
+            Instruction::ArraySliceAssign { .. } => {
+                self.write_line("// array slice assignment");
+            }
+            Instruction::UnitRangeLength { dest, start, stop } => {
+                let dest_name = self.var_to_rust(dest);
+                let start_name = self.var_to_rust(start);
+                let stop_name = self.var_to_rust(stop);
+                self.write_line(&format!(
+                    "let {}: i64 = if {} < {} {{ 0 }} else {{ {} - {} + 1 }};",
+                    dest_name, stop_name, start_name, stop_name, start_name
+                ));
+            }
+            Instruction::GetIndex {
+                dest,
+                array,
+                indices,
+            } => {
                 let dest_name = self.var_to_rust(dest);
                 let array_name = self.var_to_rust(array);
-                let index_name = self.var_to_rust(index);
+                let index_names = indices
+                    .iter()
+                    .map(|index| format!("{} as usize", self.var_to_rust(index)))
+                    .collect::<Vec<_>>()
+                    .join("][");
                 let ty = self.type_to_rust(&dest.ty);
                 self.write_line(&format!(
-                    "let {}: {} = {}[{} as usize];",
-                    dest_name, ty, array_name, index_name
+                    "let {}: {} = {}[{}];",
+                    dest_name, ty, array_name, index_names
                 ));
             }
             Instruction::SetIndex {
                 array,
-                index,
+                indices,
                 value,
             } => {
                 let array_name = self.var_to_rust(array);
-                let index_name = self.var_to_rust(index);
+                let index_names = indices
+                    .iter()
+                    .map(|index| format!("{} as usize", self.var_to_rust(index)))
+                    .collect::<Vec<_>>()
+                    .join("][");
                 let value_name = self.var_to_rust(value);
                 self.write_line(&format!(
-                    "{}[{} as usize] = {};",
-                    array_name, index_name, value_name
+                    "{}[{}] = {};",
+                    array_name, index_names, value_name
                 ));
             }
             Instruction::GetField {
@@ -273,6 +331,7 @@ impl RustCodeGenerator {
             Instruction::GetFieldOffset {
                 dest,
                 object,
+                layout_id: _,
                 offset,
             } => {
                 let dest_name = self.var_to_rust(dest);
@@ -510,5 +569,25 @@ mod tests {
         assert!(result.contains("Auto-generated"));
         assert!(result.contains("use subset_julia_vm_runtime::prelude::*;"));
         assert!(result.contains("fn main() -> ()"));
+    }
+
+    #[test]
+    fn rust_codegen_rand_uses_runtime_rng() {
+        let mut codegen = RustCodeGenerator::default_config();
+        let mut function = IrFunction::new("sample".to_string(), vec![], StaticType::F64);
+        let destination = VarRef::new("sampled".to_string(), StaticType::F64);
+        function.entry_block_mut().unwrap().push(Instruction::Rand {
+            dest: destination.clone(),
+            dims: vec![],
+        });
+        function
+            .entry_block_mut()
+            .unwrap()
+            .set_terminator(Terminator::Return(Some(destination)));
+
+        let generated = codegen.generate_function(&function).unwrap();
+
+        assert!(generated.contains("let sampled: f64 = __sjulia_aot_rand();"));
+        assert!(!generated.contains("Default::default()"));
     }
 }
