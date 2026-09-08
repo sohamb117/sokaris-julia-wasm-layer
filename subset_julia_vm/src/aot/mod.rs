@@ -82,8 +82,11 @@ pub mod native_calls;
 pub mod optimizer;
 pub mod pass_pipeline;
 pub mod rooting;
+mod script_entry;
 pub mod specialization;
 pub mod types;
+
+pub use script_entry::SCRIPT_ENTRY_NAME;
 
 /// Code-generation backend selected for the AoT pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -431,7 +434,7 @@ pub fn compile_program(
 }
 
 fn prepare_aot_program(
-    program: crate::ir::core::Program,
+    mut program: crate::ir::core::Program,
     config: &CompileConfig,
 ) -> AotResult<PreparedAotProgram> {
     use crate::aot::analyze::program_to_aot_ir;
@@ -439,6 +442,10 @@ fn prepare_aot_program(
     use crate::aot::inference::TypeInferenceEngine;
     use crate::aot::optimizer::optimize_aot_program_at_level_with_options;
     use crate::aot::pass_pipeline::{AotDumpSelection, AotPassDiagnostics, AotPassStage};
+
+    if config.requests_script_entry() {
+        script_entry::lift_script_entry(&mut program)?;
+    }
 
     let mut stats = AotStats::new();
     let mut timings: Vec<(&'static str, std::time::Duration)> = Vec::new();
@@ -449,15 +456,13 @@ fn prepare_aot_program(
     // Dead Code Elimination
     let t = AotTimer::start();
     stats.functions_total = program.functions.len();
-    let program = if config.c_abi_exports.is_empty() {
-        let call_graph = CallGraph::from_program(&program);
-        call_graph.filter_program(&program)
-    } else {
-        // C ABI exports are resolved after inference/AoT conversion and may name
-        // generated method symbols such as `add_i64_i64`; keep all functions so
-        // DCE cannot delete export candidates before codegen validates them.
-        program
-    };
+    let call_graph = CallGraph::from_program(&program);
+    let export_roots = config
+        .c_abi_exports
+        .iter()
+        .map(|export| export.function_name.clone())
+        .collect::<Vec<_>>();
+    let program = call_graph.filter_program_with_roots(&program, &export_roots);
     stats.functions_eliminated = stats.functions_total - program.functions.len();
     timings.push(("dead-code-elimination", t.elapsed()));
 
@@ -472,10 +477,12 @@ fn prepare_aot_program(
     // Type inference
     let t = AotTimer::start();
     let mut type_engine = TypeInferenceEngine::new();
-    let typed_program = type_engine.analyze_program(&program)?;
+    let mut typed_program = type_engine.analyze_program(&program)?;
     stats.functions_compiled = program.functions.len();
     stats.type_inferences = typed_program.function_count();
     timings.push(("type-inference", t.elapsed()));
+
+    apply_wasm_import_declarations(&mut program, &mut typed_program, &config.wasm_imports)?;
 
     // Convert Core IR to AoT IR
     let t = AotTimer::start();
@@ -519,6 +526,77 @@ fn prepare_aot_program(
         dynamic_count,
         dynamic_diagnostics,
     })
+}
+
+fn apply_wasm_import_declarations(
+    program: &mut crate::ir::core::Program,
+    typed: &mut inference::TypedProgram,
+    imports: &[WasmImport],
+) -> AotResult<()> {
+    for import in imports {
+        let matches: Vec<_> = program
+            .functions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, function)| {
+                (function.name == import.function_name).then_some(index)
+            })
+            .collect();
+        let [index] = matches.as_slice() else {
+            return Err(AotError::UnsupportedInstruction(
+                UnsupportedInstructionDiagnostic::new(format!(
+                    "Wasm import `{}.{}` must resolve to exactly one top-level function `{}`; found {}",
+                    import.module,
+                    import.name,
+                    import.function_name,
+                    matches.len()
+                )),
+            ));
+        };
+        let typed_functions = typed
+            .functions
+            .get_mut(&import.function_name)
+            .ok_or_else(|| {
+                AotError::InternalError(format!(
+                    "missing inferred signature for Wasm import `{}`",
+                    import.function_name
+                ))
+            })?;
+        let [typed_function] = typed_functions.as_mut_slice() else {
+            return Err(AotError::UnsupportedInstruction(
+                UnsupportedInstructionDiagnostic::new(format!(
+                    "Wasm import `{}.{}` requires one inferred signature for `{}`; found {}",
+                    import.module,
+                    import.name,
+                    import.function_name,
+                    typed_functions.len()
+                )),
+            ));
+        };
+        if typed_function.signature.param_names.len() != import.params.len() {
+            return Err(AotError::UnsupportedInstruction(
+                UnsupportedInstructionDiagnostic::new(format!(
+                    "Wasm import `{}.{}` parameter count does not match `{}`",
+                    import.module, import.name, import.function_name
+                )),
+            ));
+        }
+        typed_function.signature = inference::FunctionSignature::new(
+            import.function_name.clone(),
+            typed_function.signature.param_names.clone(),
+            import.params.clone(),
+            import.result.clone().unwrap_or(types::StaticType::Nothing),
+        );
+        let function = std::sync::Arc::make_mut(&mut program.functions[*index]);
+        function.body.stmts = vec![crate::ir::core::Stmt::Meta {
+            annotation: crate::ir::core::MetaAnnotation {
+                name: "noinline".to_string(),
+                args: Vec::new(),
+            },
+            span: function.span,
+        }];
+    }
+    Ok(())
 }
 
 fn codegen_config_from_compile_config(config: &CompileConfig) -> codegen::CodegenConfig {
@@ -569,7 +647,8 @@ pub fn compile_wasm(
         &prepared.aot_program,
     )?;
     let started = AotTimer::start();
-    let module = codegen::wasm::lower_program(&prepared.aot_program)?;
+    let module =
+        codegen::wasm::lower_program_with_imports(&prepared.aot_program, &config.wasm_imports)?;
     prepared
         .timings
         .push(("wasm-ir-lowering", started.elapsed()));
@@ -2877,6 +2956,238 @@ mod tests {
             span,
         });
         program
+    }
+
+    #[test]
+    fn script_entry_lifts_main_and_preserves_spans_issue_2() {
+        let mut program = scalar_bool_main_program();
+        let main_span = program.main.span;
+        let statement = program.main.stmts[0].clone();
+
+        script_entry::lift_script_entry(&mut program).expect("script entry should lift main");
+
+        assert!(program.main.stmts.is_empty());
+        assert_eq!(program.functions.len(), 1);
+        let entry = &program.functions[0];
+        assert_eq!(entry.name, SCRIPT_ENTRY_NAME);
+        assert!(entry.params.is_empty());
+        assert_eq!(entry.body.span, main_span);
+        assert_eq!(entry.body.stmts.first(), Some(&statement));
+        assert!(matches!(
+            entry.body.stmts.last(),
+            Some(Stmt::Return { value: None, .. })
+        ));
+    }
+
+    #[test]
+    fn script_entry_rejects_reserved_name_collision_issue_2() {
+        let mut program = empty_program();
+        let span = Span::new(0, 4, 1, 1, 1, 5);
+        program.functions.push(Arc::new(Function {
+            name: SCRIPT_ENTRY_NAME.to_string(),
+            params: vec![],
+            kwparams: vec![],
+            type_params: vec![],
+            return_type: None,
+            body: Block {
+                stmts: vec![],
+                span,
+            },
+            is_base_extension: false,
+            is_runtime_eval: false,
+            new_struct_name: None,
+            span,
+        }));
+
+        let error = script_entry::lift_script_entry(&mut program)
+            .expect_err("reserved name must be rejected");
+
+        assert!(error.to_string().contains(SCRIPT_ENTRY_NAME));
+    }
+
+    #[test]
+    fn default_compile_config_does_not_request_script_entry_issue_2() {
+        assert!(!CompileConfig::default().requests_script_entry());
+    }
+
+    #[cfg(feature = "aot-wasm")]
+    #[test]
+    fn script_entry_survives_source_to_wasm_pipeline_issue_2() {
+        let mut config = CompileConfig {
+            backend: AotBackend::Wasm,
+            ..CompileConfig::default()
+        };
+        config.enable_script_entry();
+
+        let output = compile_wasm_source("x = 40\ny = 2\nx + y\n", &config)
+            .expect("top-level source should compile through the script entry");
+
+        assert!(output
+            .wasm_bytes
+            .windows(SCRIPT_ENTRY_NAME.len())
+            .any(|window| window == SCRIPT_ENTRY_NAME.as_bytes()));
+    }
+
+    #[cfg(feature = "aot-wasm")]
+    #[test]
+    fn script_entry_eliminates_captured_closure_types_issue_3() {
+        let source = r#"
+function gamma(exponent::Float64)
+    return function(channel::Float64)::Float64
+        adjusted = channel ^ exponent
+        return adjusted
+    end
+end
+correct = gamma(0.85)
+result = correct(0.25)
+"#;
+        let program = crate::pipeline::parse_source(source).expect("source should lower");
+        let mut config = CompileConfig {
+            backend: AotBackend::Wasm,
+            ..CompileConfig::default()
+        };
+        config.enable_script_entry();
+
+        let prepared = prepare_aot_program(program, &config).expect("AoT preparation should pass");
+        let entry = prepared
+            .aot_program
+            .functions
+            .iter()
+            .find(|function| function.name == SCRIPT_ENTRY_NAME)
+            .expect("script entry should exist");
+        let rendered = format!("{:#?}", entry.body);
+        assert!(!rendered.contains("Lambda"), "closure survived: {rendered}");
+        assert!(
+            !rendered.contains("Function {"),
+            "function slot survived: {rendered}"
+        );
+        let program_rendered = format!("{:#?}", prepared.aot_program.functions);
+        assert!(
+            !program_rendered.contains("Lambda")
+                && !program_rendered.contains("return_type: Function")
+                && !program_rendered.contains("ty: Function"),
+            "closure helper survived: {program_rendered}"
+        );
+    }
+
+    #[cfg(feature = "aot-wasm")]
+    #[test]
+    fn script_entry_prunes_inlined_named_pipeline_helpers_issue_3() {
+        let source = r#"
+▷(value, transform) = transform(value)
+float(image::Array{UInt8,3})::Array{UInt8,3} = image
+image = zeros(UInt8, 4, 1, 1)
+processed = image ▷ float
+"#;
+        let program = crate::pipeline::parse_source(source).expect("source should lower");
+        let mut config = CompileConfig {
+            backend: AotBackend::Wasm,
+            ..CompileConfig::default()
+        };
+        config.enable_script_entry();
+
+        let prepared = prepare_aot_program(program, &config).expect("AoT preparation should pass");
+        assert_eq!(
+            prepared
+                .aot_program
+                .functions
+                .iter()
+                .map(|function| function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![SCRIPT_ENTRY_NAME]
+        );
+    }
+
+    #[cfg(feature = "aot-wasm")]
+    #[test]
+    fn imported_array_call_survives_aot_conversion_issue_5() {
+        let source = r#"
+load(path::String)::Array{UInt8,3} = Array{UInt8,3}(undef, 0, 0, 0)
+image = load("inputs/input.png")
+"#;
+        let program = crate::pipeline::parse_source(source).expect("source should lower");
+        let mut config = CompileConfig {
+            backend: AotBackend::Wasm,
+            wasm_imports: vec![WasmImport {
+                module: "sjulia_host".to_string(),
+                name: "load".to_string(),
+                function_name: "load".to_string(),
+                params: vec![types::StaticType::Str],
+                result: Some(types::StaticType::Array {
+                    element: Box::new(types::StaticType::U8),
+                    ndims: Some(3),
+                }),
+            }],
+            ..CompileConfig::default()
+        };
+        config.enable_script_entry();
+
+        let prepared = prepare_aot_program(program, &config).expect("AoT preparation should pass");
+        let entry = prepared
+            .aot_program
+            .functions
+            .iter()
+            .find(|function| function.name == SCRIPT_ENTRY_NAME)
+            .expect("script entry should exist");
+
+        assert!(
+            !format!("{:?}", entry.body).contains("LitNothing"),
+            "script entry contains a placeholder: {:?}",
+            entry.body
+        );
+        assert!(format!("{:?}", entry.body).contains("CallStatic"));
+    }
+
+    #[cfg(feature = "aot-wasm")]
+    #[test]
+    fn wasm_static_payloads_share_one_data_section_issue_6() {
+        fn read_leb(bytes: &[u8], cursor: &mut usize) -> usize {
+            let mut value = 0_usize;
+            let mut shift = 0;
+            loop {
+                let byte = bytes[*cursor];
+                *cursor += 1;
+                value |= usize::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
+                    return value;
+                }
+                shift += 7;
+            }
+        }
+
+        let mut config = CompileConfig {
+            backend: AotBackend::Wasm,
+            wasm_imports: vec![WasmImport {
+                module: "host".to_string(),
+                name: "value".to_string(),
+                function_name: "host_value".to_string(),
+                params: vec![types::StaticType::Str],
+                result: Some(types::StaticType::I64),
+            }],
+            ..CompileConfig::default()
+        };
+        config
+            .c_abi_exports
+            .push(codegen::CAbiExport::new("answer", "answer"));
+        let source = r#"
+host_value(value::String)::Int64 = 0
+answer()::Int64 = host_value("static payload")
+"#;
+
+        let output = compile_wasm_source(source, &config).expect("module should compile");
+        let mut cursor = 8;
+        let mut data_sections = 0;
+        while cursor < output.wasm_bytes.len() {
+            let section = output.wasm_bytes[cursor];
+            cursor += 1;
+            let size = read_leb(&output.wasm_bytes, &mut cursor);
+            if section == 11 {
+                data_sections += 1;
+            }
+            cursor += size;
+        }
+
+        assert_eq!(data_sections, 1);
     }
 
     #[cfg(not(feature = "cranelift"))]

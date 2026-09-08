@@ -65,15 +65,33 @@ fn compile_to_wasm_reports_source_located_parse_diagnostic() {
 }
 
 #[test]
-fn compile_to_wasm_reports_unsupported_diagnostic_without_panicking() {
-    // Given: a statically typed function outside the Wasm backend subset.
+fn compile_to_wasm_supports_string_views() {
+    // Given: a statically typed String identity exported through the Wasm ABI.
     let source = "string_identity(value::String)::String = value";
     let options = CompileOptions::for_test_export("string_identity", &["String"]);
 
-    // When: backend lowering rejects the unsupported type.
+    // When: browser compilation lowers the immutable String view.
     let result = compile_to_wasm_internal(source, options);
 
-    // Then: the rejection is a typed diagnostic, not a panic or fallback module.
+    // Then: the generated module is valid instead of reporting String as unsupported.
+    assert!(
+        result.success,
+        "unexpected diagnostics: {:?}",
+        result.diagnostics
+    );
+    assert_eq!(&result.wasm_bytes[..4], b"\0asm");
+}
+
+#[test]
+fn compile_to_wasm_rejects_dynamic_string_interpolation() {
+    // Given: interpolation that requires unsupported dynamic String construction.
+    let source = "interpolate(value::Int64)::String = \"value = $value\"";
+    let options = CompileOptions::for_test_export("interpolate", &["Int64"]);
+
+    // When: browser compilation reaches dynamic String lowering.
+    let result = compile_to_wasm_internal(source, options);
+
+    // Then: the rejection remains a typed diagnostic, not a panic or fallback module.
     assert!(!result.success);
     assert!(result.wasm_bytes.is_empty());
     assert_eq!(result.diagnostics[0].kind, "unsupported");
@@ -104,4 +122,59 @@ answer(value::Int64)::Int64 = host_scale(value) + 2
     assert_eq!(result.imports[0].function_name, "host_scale");
     assert_eq!(result.imports[0].params, ["Int64"]);
     assert_eq!(result.imports[0].result.as_deref(), Some("Int64"));
+}
+
+#[test]
+fn compile_to_wasm_exposes_script_entry_metadata_issue_2() {
+    let result =
+        compile_to_wasm_internal("x = 40\ny = 2\nx + y\n", CompileOptions::for_test_script());
+
+    assert!(
+        result.success,
+        "unexpected diagnostics: {:?}",
+        result.diagnostics
+    );
+    assert_eq!(result.entry_point.as_deref(), Some("__sjulia_script_entry"));
+}
+
+#[test]
+fn compile_to_wasm_preserves_exports_mode_by_default_issue_2() {
+    let result = compile_to_wasm_internal(
+        "answer()::Int64 = 42",
+        CompileOptions::for_test_export("answer", &[]),
+    );
+
+    assert!(result.success);
+    assert_eq!(result.entry_point, None);
+}
+
+#[test]
+fn compile_to_wasm_rejects_invalid_entry_mode_issue_2() {
+    let result = compile_to_wasm_internal(
+        "x = 42",
+        CompileOptions::for_test_entry_mode("rewritten-main"),
+    );
+
+    assert!(!result.success);
+    assert_eq!(result.diagnostics[0].code, "invalid_entry_mode");
+}
+
+#[test]
+fn compile_to_wasm_script_resolves_typed_image_host_imports() {
+    let source = r#"
+load(path::String)::Array{UInt8,3} = Array{UInt8,3}(undef, 0, 0, 0)
+image = load("inputs/input.png")
+"#;
+    let result = compile_to_wasm_internal(source, CompileOptions::for_test_image_script());
+
+    assert!(
+        result.success,
+        "unexpected diagnostics: {:?}",
+        result.diagnostics
+    );
+    assert_eq!(result.entry_point.as_deref(), Some("__sjulia_script_entry"));
+    assert_eq!(result.imports.len(), 1);
+    assert_eq!(result.imports[0].function_name, "load");
+    assert_eq!(result.imports[0].params, ["String"]);
+    assert_eq!(result.imports[0].result.as_deref(), Some("Array{UInt8, 3}"));
 }
